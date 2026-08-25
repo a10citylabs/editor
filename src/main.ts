@@ -189,15 +189,79 @@ function displayPipeline(): Pipeline {
     return pipeline;
 }
 
-/** How many device pixels the preview box can actually show. */
-function previewBox(): { width: number; height: number } {
+/**
+ * The preview box, in both the units that matter.
+ *
+ * `css` is the space on screen the image has to fit into; `device` is how many
+ * real pixels that space is worth, which is what the engine renders. On a
+ * HiDPI screen the two differ by the pixel ratio, and conflating them is what
+ * makes a canvas come out stretched: the backing store is sized in device
+ * pixels but laid out in CSS ones.
+ */
+function previewBox(): { cssWidth: number; cssHeight: number; width: number; height: number } {
+    // `clientWidth`/`clientHeight` round to whole pixels while the padding
+    // does not, which can overstate the box by most of a pixel - enough for
+    // the canvas to poke out from under the crop overlay. The rect is exact.
+    const rect = ui.canvasViewport.getBoundingClientRect();
     const style = getComputedStyle(ui.canvasViewport);
-    const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
-    const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const padX =
+        parseFloat(style.paddingLeft) +
+        parseFloat(style.paddingRight) +
+        parseFloat(style.borderLeftWidth) +
+        parseFloat(style.borderRightWidth);
+    const padY =
+        parseFloat(style.paddingTop) +
+        parseFloat(style.paddingBottom) +
+        parseFloat(style.borderTopWidth) +
+        parseFloat(style.borderBottomWidth);
+
+    const cssWidth = Math.max(0, rect.width - padX);
+    const cssHeight = Math.max(0, rect.height - padY);
+
+    // The render resolution is a separate question: never ask the engine for
+    // a postage stamp, and never for more pixels than a screen can show.
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = Math.max(160, Math.round((ui.canvasViewport.clientWidth - padX) * dpr));
-    const height = Math.max(160, Math.round((ui.canvasViewport.clientHeight - padY) * dpr));
-    return { width: Math.min(width, 2400), height: Math.min(height, 2400) };
+    return {
+        cssWidth,
+        cssHeight,
+        width: Math.min(Math.max(160, Math.round(cssWidth * dpr)), 2400),
+        height: Math.min(Math.max(160, Math.round(cssHeight * dpr)), 2400),
+    };
+}
+
+/**
+ * Scale `w` x `h` down until it fits inside the box, keeping the ratio and
+ * never enlarging. The mirror of `ops::fit_within` in the engine, so the
+ * layout maths and the render maths agree on what "fits" means.
+ */
+function fitWithin(
+    w: number,
+    h: number,
+    maxW: number,
+    maxH: number,
+): { width: number; height: number } {
+    if (w <= 0 || h <= 0) return { width: 0, height: 0 };
+    const scale = Math.min(maxW / w, maxH / h, 1);
+    return { width: w * scale, height: h * scale };
+}
+
+/**
+ * Give the canvas an explicit display size instead of leaving it to `max-width`
+ * and the flex algorithm, which size the two axes independently and so throw
+ * the aspect ratio away. Fitting the frame we actually received into the box
+ * we actually have is also self-correcting: a window resize between asking for
+ * a frame and drawing it costs a little sharpness, never a stretched image.
+ */
+function layoutCanvas(): void {
+    if (!ui.canvas.width || !ui.canvas.height) return;
+    const box = previewBox();
+    // A collapsed box means the stage is hidden; leave the last good size in
+    // place rather than flattening the canvas to nothing.
+    if (box.cssWidth <= 0 || box.cssHeight <= 0) return;
+
+    const size = fitWithin(ui.canvas.width, ui.canvas.height, box.cssWidth, box.cssHeight);
+    ui.canvas.style.width = `${size.width}px`;
+    ui.canvas.style.height = `${size.height}px`;
 }
 
 /**
@@ -253,6 +317,7 @@ function onFrame(frame: PreviewResult): void {
         0,
         0,
     );
+    layoutCanvas();
 
     // The overlay tracks the frame it is drawn on, which in crop mode is the
     // untrimmed image and therefore exactly crop space.
@@ -927,8 +992,12 @@ function wireStage(): void {
     ui.compareBtn.addEventListener('keyup', endCompare);
     ui.compareBtn.addEventListener('blur', endCompare);
 
+    // Re-fit what is already on screen straight away so the image never lags
+    // the box it sits in, then re-render once the drag settles to recover the
+    // resolution the new box is worth.
     let resizeTimer: number | undefined;
     window.addEventListener('resize', () => {
+        layoutCanvas();
         window.clearTimeout(resizeTimer);
         resizeTimer = window.setTimeout(() => refresh(), 150);
     });
