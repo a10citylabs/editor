@@ -1,0 +1,19 @@
+{
+  "name": "a10city-image-editor",
+  "private": true,
+  "version": "1.0.0",
+  "description": "A WebAssembly image editor - convert, resize, crop and rotate entirely in the browser. Rust engine, no uploads.",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build crates/imagecore --target web --out-dir ../../src/wasm --out-name imagecore --release",
+    "dev": "npm run build:wasm && vite",
+    "build": "npm run build:wasm && tsc && vite build",
+    "preview": "vite preview",
+    "test": "cargo test -p imagecore",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}

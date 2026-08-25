@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Convert, resize, crop and rotate images in your browser. A Rust and WebAssembly image editor - nothing is uploaded.">
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://a10city.com/editor/">
+  <meta property="og:title" content="Image Editor | A10city">
+  <meta property="og:description" content="Convert, resize, crop and rotate images in your browser. Rust and WebAssembly - nothing is uploaded.">
+  <meta property="og:image" content="https://a10city.com/img/logo.png">
+
+  <!-- Twitter -->
+  <meta property="twitter:card" content="summary_large_image">
+  <meta property="twitter:url" content="https://a10city.com/editor/">
+  <meta property="twitter:site" content="@a10city">
+  <meta property="twitter:title" content="Image Editor | A10city">
+  <meta property="twitter:description" content="Convert, resize, crop and rotate images in your browser. Rust and WebAssembly - nothing is uploaded.">
+  <meta property="twitter:image" content="https://a10city.com/img/logo.png">
+
+  <title>Image Editor | A10city</title>
+  <link rel="icon" href="img/favicon.ico" type="image/x-icon">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/style.css">
+  <link rel="stylesheet" href="/src/editor.css">
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <header role="banner">
+    <nav class="navbar" aria-label="Main navigation">
+      <div class="nav-container">
+        <a href="https://a10city.com/" class="nav-brand" aria-label="A10city Home">A<span>10</span>city</a>
+        <ul class="nav-menu" role="list">
+          <li><a href="https://a10city.com/" class="nav-link">Home</a></li>
+          <li><a href="https://a10city.com/verify" class="nav-link">C2PA Viewer</a></li>
+          <li><a href="https://a10city.com/editor" class="nav-link" aria-current="page">Image Editor</a></li>
+        </ul>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main-content" class="page-container editor-page">
+    <header class="page-header">
+      <h1>Image Editor <span>WebAssembly</span></h1>
+      <p class="page-subtitle">Convert, resize, crop and rotate &mdash; entirely in your browser</p>
+    </header>
+
+    <div class="editor-layout">
+      <!-- ===================== Stage ===================== -->
+      <section class="stage" aria-labelledby="stage-heading">
+        <h2 id="stage-heading" class="sr-only">Image preview</h2>
+
+        <!-- Empty state / drop target -->
+        <div class="dropzone" id="dropzone" role="button" tabindex="0"
+             aria-label="Choose an image, or drop one here">
+          <input type="file" id="file-input" accept="image/*,.tga,.qoi,.ppm,.pnm,.ff,.hdr" hidden>
+          <div class="dropzone-icon" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+              <circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
+          </div>
+          <span class="dropzone-text">Drop an image here</span>
+          <span class="dropzone-subtext">or click to browse &mdash; it never leaves your device</span>
+          <div class="supported-formats" id="input-formats"></div>
+        </div>
+
+        <!-- Loaded state -->
+        <div class="canvas-shell" id="canvas-shell" hidden>
+          <div class="stage-bar">
+            <div class="stage-file">
+              <span class="file-name" id="file-name">&mdash;</span>
+              <span class="format-tag" id="source-format">&mdash;</span>
+            </div>
+            <div class="stage-actions">
+              <button type="button" class="btn-ghost" id="compare-btn"
+                      aria-label="Hold to compare with the original" aria-pressed="false">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10"/><path d="M12 2v20"/><path d="M12 7H7a2 2 0 0 0 0 4h10a2 2 0 0 1 0 4h-5"/>
+                </svg>
+                <span>Original</span>
+              </button>
+              <button type="button" class="btn-ghost" id="reset-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 2v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L3 8"/>
+                </svg>
+                <span>Reset</span>
+              </button>
+              <button type="button" class="btn-ghost" id="replace-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <span>New image</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="canvas-viewport" id="canvas-viewport">
+            <div class="canvas-frame" id="canvas-frame">
+              <canvas id="preview-canvas" aria-label="Edited image preview" role="img"></canvas>
+              <div class="crop-overlay" id="crop-overlay" hidden>
+                <div class="crop-shade crop-shade-top"></div>
+                <div class="crop-shade crop-shade-bottom"></div>
+                <div class="crop-shade crop-shade-left"></div>
+                <div class="crop-shade crop-shade-right"></div>
+                <div class="crop-box" id="crop-box" tabindex="0" role="application"
+                     aria-label="Crop selection. Drag to move, or use arrow keys.">
+                  <span class="crop-grid" aria-hidden="true"></span>
+                  <span class="crop-handle" data-handle="nw"></span>
+                  <span class="crop-handle" data-handle="n"></span>
+                  <span class="crop-handle" data-handle="ne"></span>
+                  <span class="crop-handle" data-handle="e"></span>
+                  <span class="crop-handle" data-handle="se"></span>
+                  <span class="crop-handle" data-handle="s"></span>
+                  <span class="crop-handle" data-handle="sw"></span>
+                  <span class="crop-handle" data-handle="w"></span>
+                </div>
+              </div>
+            </div>
+            <div class="stage-busy" id="stage-busy" hidden aria-hidden="true">
+              <div class="spinner"></div>
+            </div>
+          </div>
+
+          <div class="stage-status" role="status">
+            <span class="status-chunk">
+              <span class="status-label">Source</span>
+              <span class="status-value" id="status-source">&mdash;</span>
+            </span>
+            <span class="status-arrow" aria-hidden="true">&rarr;</span>
+            <span class="status-chunk">
+              <span class="status-label">Output</span>
+              <span class="status-value accent" id="status-output">&mdash;</span>
+            </span>
+            <span class="status-chunk status-timing">
+              <span class="status-label">Render</span>
+              <span class="status-value" id="status-timing">&mdash;</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="stage-error" id="stage-error" hidden>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          <p id="stage-error-message"></p>
+        </div>
+      </section>
+
+      <!-- ===================== Controls ===================== -->
+      <aside class="controls" aria-label="Editing controls">
+        <details id="panel-transform" class="panel" open>
+          <summary class="panel-head">
+            <span class="panel-title">Transform</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="control-row">
+              <span class="control-label" id="rotate-label">Rotate</span>
+              <div class="btn-group" role="group" aria-labelledby="rotate-label">
+                <button type="button" class="btn-icon" id="rot-ccw" aria-label="Rotate 90 degrees counter-clockwise">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 2v6h6"/><path d="M3.51 9a9 9 0 1 1-.49 5"/>
+                  </svg>
+                </button>
+                <button type="button" class="btn-icon" id="rot-cw" aria-label="Rotate 90 degrees clockwise">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 2v6h-6"/><path d="M20.49 9a9 9 0 1 0 .49 5"/>
+                  </svg>
+                </button>
+                <button type="button" class="btn-icon" id="flip-h" aria-label="Flip horizontally" aria-pressed="false">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 3v18"/><path d="M8 8L3 12l5 4z"/><path d="M16 8l5 4-5 4z"/>
+                  </svg>
+                </button>
+                <button type="button" class="btn-icon" id="flip-v" aria-label="Flip vertically" aria-pressed="false">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 12h18"/><path d="M8 8l4-5 4 5z"/><path d="M8 16l4 5 4-5z"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="control-row stacked">
+              <label class="control-label" for="angle-input">
+                Straighten
+                <output class="control-readout" id="angle-readout">0.0&deg;</output>
+              </label>
+              <input type="range" id="angle-input" min="-45" max="45" step="0.1" value="0"
+                     aria-describedby="angle-help">
+              <p class="control-help" id="angle-help">
+                Free rotation resamples; the buttons above are lossless.
+              </p>
+            </div>
+
+            <div class="control-row stacked" id="matte-row" hidden>
+              <label class="control-label" for="matte-input">
+                Corner fill
+                <span class="control-readout" id="matte-readout">Transparent</span>
+              </label>
+              <div class="matte-picker">
+                <button type="button" class="swatch swatch-clear is-active" data-matte="transparent"
+                        aria-label="Transparent corners" aria-pressed="true"></button>
+                <button type="button" class="swatch" data-matte="#ffffff" style="--swatch:#ffffff"
+                        aria-label="White corners" aria-pressed="false"></button>
+                <button type="button" class="swatch" data-matte="#0d2137" style="--swatch:#0d2137"
+                        aria-label="Navy corners" aria-pressed="false"></button>
+                <button type="button" class="swatch" data-matte="#000000" style="--swatch:#000000"
+                        aria-label="Black corners" aria-pressed="false"></button>
+                <input type="color" id="matte-input" value="#a4e439" aria-label="Custom corner colour">
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details id="panel-crop" class="panel" open>
+          <summary class="panel-head">
+            <span class="panel-title">Crop</span>
+            <span class="panel-badge" id="crop-badge" hidden>on</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="control-row">
+              <span class="control-label" id="aspect-label">Ratio</span>
+              <div class="chip-row" role="group" aria-labelledby="aspect-label" id="aspect-row">
+                <button type="button" class="chip is-active" data-aspect="free">Free</button>
+                <button type="button" class="chip" data-aspect="1">1:1</button>
+                <button type="button" class="chip" data-aspect="1.3333">4:3</button>
+                <button type="button" class="chip" data-aspect="1.7778">16:9</button>
+                <button type="button" class="chip" data-aspect="0.75">3:4</button>
+                <button type="button" class="chip" data-aspect="0.5625">9:16</button>
+              </div>
+            </div>
+
+            <div class="field-grid">
+              <label class="field">
+                <span>X</span>
+                <input type="number" id="crop-x" min="0" step="1" value="0">
+              </label>
+              <label class="field">
+                <span>Y</span>
+                <input type="number" id="crop-y" min="0" step="1" value="0">
+              </label>
+              <label class="field">
+                <span>W</span>
+                <input type="number" id="crop-w" min="1" step="1" value="0">
+              </label>
+              <label class="field">
+                <span>H</span>
+                <input type="number" id="crop-h" min="1" step="1" value="0">
+              </label>
+            </div>
+
+            <div class="control-row split">
+              <button type="button" class="btn-ghost sm" id="crop-clear">Clear</button>
+              <button type="button" class="btn-ghost sm" id="crop-center">Centre</button>
+            </div>
+            <p class="control-help">Drag on the preview to select. Arrow keys nudge, Shift for 10px.</p>
+          </div>
+        </details>
+
+        <details id="panel-resize" class="panel" open>
+          <summary class="panel-head">
+            <span class="panel-title">Resize</span>
+            <span class="panel-badge" id="resize-badge" hidden>on</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="field-grid two">
+              <label class="field">
+                <span>Width</span>
+                <input type="number" id="resize-w" min="1" max="20000" step="1">
+              </label>
+              <label class="field">
+                <span>Height</span>
+                <input type="number" id="resize-h" min="1" max="20000" step="1">
+              </label>
+            </div>
+
+            <div class="control-row split">
+              <label class="switch">
+                <input type="checkbox" id="lock-aspect" checked>
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Lock aspect</span>
+              </label>
+              <div class="chip-row compact" role="group" aria-label="Scale to a percentage">
+                <button type="button" class="chip" data-scale="0.25">25%</button>
+                <button type="button" class="chip" data-scale="0.5">50%</button>
+                <button type="button" class="chip" data-scale="2">200%</button>
+              </div>
+            </div>
+
+            <label class="field wide">
+              <span>Resampling</span>
+              <select id="resize-filter">
+                <option value="lanczos3" selected>Lanczos 3 &mdash; sharpest</option>
+                <option value="mitchell">Mitchell &mdash; balanced</option>
+                <option value="catmullrom">Catmull-Rom &mdash; crisp</option>
+                <option value="hamming">Hamming &mdash; smooth</option>
+                <option value="bilinear">Bilinear &mdash; fast</option>
+                <option value="box">Box &mdash; area average</option>
+                <option value="nearest">Nearest &mdash; pixel art</option>
+              </select>
+            </label>
+
+            <div class="control-row split">
+              <button type="button" class="btn-ghost sm" id="resize-clear">Reset to source</button>
+            </div>
+          </div>
+        </details>
+
+        <details id="panel-adjust" class="panel">
+          <summary class="panel-head">
+            <span class="panel-title">Adjust</span>
+            <span class="panel-badge" id="adjust-badge" hidden>on</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="control-row stacked">
+              <label class="control-label" for="adj-brightness">Brightness <output class="control-readout" id="adj-brightness-out">0</output></label>
+              <input type="range" id="adj-brightness" min="-0.5" max="0.5" step="0.01" value="0">
+            </div>
+            <div class="control-row stacked">
+              <label class="control-label" for="adj-contrast">Contrast <output class="control-readout" id="adj-contrast-out">0</output></label>
+              <input type="range" id="adj-contrast" min="-0.6" max="0.6" step="0.01" value="0">
+            </div>
+            <div class="control-row stacked">
+              <label class="control-label" for="adj-saturation">Saturation <output class="control-readout" id="adj-saturation-out">0</output></label>
+              <input type="range" id="adj-saturation" min="-1" max="1" step="0.01" value="0">
+            </div>
+            <div class="control-row stacked">
+              <label class="control-label" for="adj-sharpen">Sharpen <output class="control-readout" id="adj-sharpen-out">0</output></label>
+              <input type="range" id="adj-sharpen" min="0" max="2" step="0.05" value="0">
+            </div>
+            <div class="control-row stacked">
+              <label class="control-label" for="adj-blur">Blur <output class="control-readout" id="adj-blur-out">0</output></label>
+              <input type="range" id="adj-blur" min="0" max="12" step="0.2" value="0">
+            </div>
+            <div class="control-row split">
+              <label class="switch">
+                <input type="checkbox" id="adj-grayscale">
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Grayscale</span>
+              </label>
+              <label class="switch">
+                <input type="checkbox" id="adj-invert">
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Invert</span>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details id="panel-export" class="panel panel-export" open>
+          <summary class="panel-head">
+            <span class="panel-title">Export</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="control-row stacked">
+              <span class="control-label" id="format-label">Format</span>
+              <div class="chip-row" role="group" aria-labelledby="format-label" id="format-row"></div>
+            </div>
+
+            <div class="control-row stacked" id="quality-row" hidden>
+              <label class="control-label" for="quality-input">
+                Quality <output class="control-readout" id="quality-readout">85</output>
+              </label>
+              <input type="range" id="quality-input" min="1" max="100" step="1" value="85">
+            </div>
+
+            <label class="field wide" id="png-row" hidden>
+              <span>PNG compression</span>
+              <select id="png-compression">
+                <option value="fast">Fast</option>
+                <option value="default" selected>Default</option>
+                <option value="best">Best &mdash; smallest</option>
+              </select>
+            </label>
+
+            <div class="control-row stacked" id="flatten-row" hidden>
+              <label class="control-label" for="flatten-input">
+                Matte for transparency
+                <span class="control-readout" id="flatten-readout">#ffffff</span>
+              </label>
+              <div class="matte-picker">
+                <button type="button" class="swatch is-active" data-flatten="#ffffff" style="--swatch:#ffffff" aria-label="White matte" aria-pressed="true"></button>
+                <button type="button" class="swatch" data-flatten="#0d2137" style="--swatch:#0d2137" aria-label="Navy matte" aria-pressed="false"></button>
+                <button type="button" class="swatch" data-flatten="#000000" style="--swatch:#000000" aria-label="Black matte" aria-pressed="false"></button>
+                <input type="color" id="flatten-input" value="#ffffff" aria-label="Custom matte colour">
+              </div>
+            </div>
+
+            <label class="field wide">
+              <span>Filename</span>
+              <input type="text" id="export-name" spellcheck="false" autocomplete="off">
+            </label>
+
+            <button type="button" class="btn-primary" id="export-btn" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span id="export-label">Download</span>
+            </button>
+            <p class="export-note" id="export-note"></p>
+          </div>
+        </details>
+
+        <p class="engine-line" id="engine-line"></p>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="site-footer" role="contentinfo">
+    <div class="footer-container">
+      <div class="footer-main">
+        <div class="footer-company">
+          <h2>A10city Private Limited</h2>
+          <div class="cin-container">
+            <span class="cin-label" id="cin-label">CIN</span>
+            <span class="cin-value" aria-labelledby="cin-label">U62013TS2025PTC208121</span>
+          </div>
+          <div class="footer-email">
+            <a href="mailto:info@a10city.com" aria-label="Send email to info@a10city.com">info@a10city.com</a>
+          </div>
+        </div>
+
+        <nav class="footer-links" aria-label="Quick links">
+          <h3>Quick Links</h3>
+          <ul role="list">
+            <li><a href="https://a10city.com/">Home</a></li>
+            <li><a href="https://a10city.com/verify">C2PA Viewer</a></li>
+            <li><a href="https://a10city.com/editor">Image Editor</a></li>
+          </ul>
+        </nav>
+
+        <nav class="footer-legal" aria-label="Legal information">
+          <h3>Legal</h3>
+          <ul role="list">
+            <li><a href="https://a10city.com/privacy-policy.html">Privacy Policy</a></li>
+            <li><a href="https://a10city.com/terms-of-service.html">Terms of Service</a></li>
+          </ul>
+        </nav>
+      </div>
+
+      <div class="footer-bottom">
+        <p class="footer-copyright">
+          &copy; <time datetime="2025">2025</time> <strong>A10city Private Limited</strong>. All rights reserved.
+        </p>
+        <nav class="footer-social" aria-label="Footer social media links">
+          <a href="https://x.com/a10city" target="_blank" rel="noopener noreferrer" aria-label="Follow A10city on X (formerly Twitter)">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+            </svg>
+          </a>
+          <a href="https://github.com/a10citylabs" target="_blank" rel="noopener noreferrer" aria-label="View A10city Labs on GitHub">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.207 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12z"/>
+            </svg>
+          </a>
+          <a href="https://www.youtube.com/@a10citylabs" target="_blank" rel="noopener noreferrer" aria-label="Subscribe to A10city Labs on YouTube">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+            </svg>
+          </a>
+        </nav>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="/src/main.ts"></script>
+  <!-- 100% privacy-first analytics -->
+  <script async src="https://scripts.simpleanalyticscdn.com/latest.js"></script>
+</body>
+</html>

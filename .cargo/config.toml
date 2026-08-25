@@ -1,0 +1,5 @@
+# WebAssembly SIMD (simd128) is what makes fast_image_resize's vectorised
+# convolution kernels light up in the browser. Supported by Chrome 91+,
+# Firefox 89+, Safari 16.4+ and every current Edge.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
