@@ -1,9 +1,10 @@
 name: CI
 
+# Pull requests only. A `push` trigger here would double every run on a PR
+# branch, and `main` is already covered by the deploy workflow's test step.
 on:
   pull_request:
-  push:
-    branches-ignore: ['main']
+  workflow_dispatch:
 
 jobs:
   engine:
