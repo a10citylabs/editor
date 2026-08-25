@@ -200,20 +200,28 @@
     overflow: hidden;
 }
 
+/* Wraps the canvas exactly, with nothing here to size it independently: the
+   crop overlay is stretched across this box (inset: 0), so any slack between
+   the two would put the selection somewhere the image is not. `layoutCanvas()`
+   is what keeps the canvas inside the viewport; the viewport's own
+   `overflow: hidden` is the backstop if it ever fails to. */
 .canvas-frame {
     position: relative;
     line-height: 0;
-    max-width: 100%;
-    max-height: 100%;
     display: flex;
 }
 
+/* Sized from JS, in `layoutCanvas()`, because CSS on its own gets it wrong
+   here: the canvas's intrinsic size is its backing store, measured in *device*
+   pixels, so on a HiDPI screen `max-width: 100%` shrinks the width against a
+   box the height never sees while flex stretches the height to the line. The
+   two axes land on different scales and the image comes out stretched - a
+   4032x3024 photo on a 1920x1080 screen at 2x was drawn 85% too wide.
+   `flex: 0 0 auto` keeps flex from having an opinion about either axis. */
 #preview-canvas {
     display: block;
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
+    flex: 0 0 auto;
+    align-self: flex-start;
     border-radius: 4px;
 }
 
