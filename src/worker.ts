@@ -8,10 +8,18 @@
  */
 
 import init, { Editor, capabilities } from './wasm/imagecore.js';
-import type { Capabilities, SourceInfo, WorkerRequest, WorkerResponse } from './types';
+import type {
+    Capabilities,
+    CredentialReport,
+    SourceInfo,
+    WorkerRequest,
+    WorkerResponse,
+} from './types';
 
 let ready: Promise<void> | null = null;
 let editor: Editor | null = null;
+/** Object URL for the open file's manifest thumbnail, revoked on replacement. */
+let credentialThumbnailUrl: string | null = null;
 
 function ensureReady(): Promise<void> {
     if (!ready) {
@@ -40,6 +48,7 @@ async function open(bytes: ArrayBuffer, name: string, type: string): Promise<Sou
             format: editor.sourceFormat,
             hasAlpha: editor.hasAlpha,
             viaBrowser: false,
+            ...readCredentials(editor),
         };
     } catch (engineError) {
         const pixels = await decodeInBrowser(bytes, type, engineError);
@@ -51,8 +60,45 @@ async function open(bytes: ArrayBuffer, name: string, type: string): Promise<Sou
             format: pixels.label,
             hasAlpha: true,
             viaBrowser: true,
+            // A browser-decoded image reaches us as raw pixels, so whatever
+            // container it arrived in - and any credential inside it - is gone.
+            credentials: null,
+            credentialThumbnail: null,
         };
     }
+}
+
+/**
+ * Pull the validated Content Credentials, if any, off a freshly opened file.
+ *
+ * The manifest thumbnail becomes an object URL here rather than in the UI
+ * because the bytes are already on this side of the worker boundary; sending
+ * them to the main thread only to wrap them there would copy them twice.
+ */
+function readCredentials(open: Editor): Pick<SourceInfo, 'credentials' | 'credentialThumbnail'> {
+    const raw = open.credentials;
+    if (!raw) return { credentials: null, credentialThumbnail: null };
+
+    let credentials: CredentialReport;
+    try {
+        credentials = JSON.parse(raw) as CredentialReport;
+    } catch {
+        return { credentials: null, credentialThumbnail: null };
+    }
+
+    // The previous file's thumbnail URL is released here rather than on open,
+    // so the UI can keep showing it until a replacement exists.
+    if (credentialThumbnailUrl) URL.revokeObjectURL(credentialThumbnailUrl);
+    // wasm-bindgen returns an owned copy for a `Vec<u8>`, so the buffer is ours
+    // to hand to a Blob rather than a view into the engine's memory.
+    const thumbnail = open.credentialThumbnail();
+    credentialThumbnailUrl = thumbnail
+        ? URL.createObjectURL(
+              new Blob([thumbnail.buffer as ArrayBuffer], { type: 'image/jpeg' }),
+          )
+        : null;
+
+    return { credentials, credentialThumbnail: credentialThumbnailUrl };
 }
 
 async function decodeInBrowser(
@@ -167,6 +213,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
                 const encoded = active.renderExport(
                     JSON.stringify(request.pipeline),
                     JSON.stringify(request.encode),
+                    request.sign ? JSON.stringify(request.sign) : '',
                 );
                 const bytes = encoded.takeBytes();
                 const result = {
@@ -176,6 +223,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
                     width: encoded.width,
                     height: encoded.height,
                     ms: performance.now() - started,
+                    manifestBytes: encoded.manifestBytes,
                 };
                 encoded.free();
 

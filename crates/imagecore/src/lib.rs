@@ -16,6 +16,7 @@
 use image::RgbaImage;
 use wasm_bindgen::prelude::*;
 
+pub mod c2pa;
 pub mod codec;
 pub mod ops;
 pub mod pipeline;
@@ -32,6 +33,7 @@ pub enum Error {
     Geometry(String),
     BadPipeline(String),
     UnsupportedOutput(String),
+    Credentials(String),
 }
 
 impl std::fmt::Display for Error {
@@ -43,6 +45,7 @@ impl std::fmt::Display for Error {
             Self::Geometry(m) => write!(f, "Invalid geometry: {m}"),
             Self::BadPipeline(m) => write!(f, "Malformed edit pipeline: {m}"),
             Self::UnsupportedOutput(m) => write!(f, "'{m}' is not a supported output format"),
+            Self::Credentials(m) => write!(f, "Content Credentials: {m}"),
         }
     }
 }
@@ -61,6 +64,11 @@ pub struct Editor {
     source: SourceCache,
     source_format: String,
     had_alpha: bool,
+    /// Content Credentials found in the file that was opened, already
+    /// validated. Only the manifest store is kept, not the source file: the
+    /// store is a few kilobytes and is all a new manifest needs to carry the
+    /// provenance chain forward.
+    credentials: Option<c2pa::ValidationReport>,
 }
 
 #[wasm_bindgen]
@@ -75,10 +83,23 @@ impl Editor {
     #[wasm_bindgen(js_name = open)]
     pub fn open(bytes: &[u8], hint: Option<String>) -> Result<Editor, JsError> {
         let decoded = codec::decode(bytes, hint.as_deref())?;
+
+        // Read any Content Credentials while the encoded bytes are still to
+        // hand - the hard binding is over those bytes, so it cannot be checked
+        // once the file has been decoded to pixels. A malformed manifest is
+        // reported as "none found" rather than failing the open: a broken
+        // credential is no reason to refuse to edit someone's photo.
+        let credentials = if c2pa::supports_format(&decoded.format) {
+            c2pa::read_jpeg(bytes).ok().flatten()
+        } else {
+            None
+        };
+
         Ok(Editor {
             source: SourceCache::new(decoded.image),
             source_format: decoded.format,
             had_alpha: decoded.had_alpha,
+            credentials,
         })
     }
 
@@ -106,6 +127,9 @@ impl Editor {
             source: SourceCache::new(source),
             source_format: label,
             had_alpha: true,
+            // Raw pixels arrive already decoded by the browser, so whatever
+            // container they came from is gone and there is nothing to read.
+            credentials: None,
         })
     }
 
@@ -174,13 +198,36 @@ impl Editor {
         })
     }
 
+    /// What the file that was opened carries, as JSON, or `None` when it has no
+    /// Content Credentials. See `c2pa::ValidationReport`.
+    #[wasm_bindgen(getter, js_name = credentials)]
+    pub fn credentials(&self) -> Option<String> {
+        self.credentials
+            .as_ref()
+            .map(c2pa::ValidationReport::to_json)
+    }
+
+    /// The thumbnail from the opened file's active manifest, if it has one.
+    /// Handed over as JPEG bytes for the host to turn into a Blob.
+    #[wasm_bindgen(js_name = credentialThumbnail)]
+    pub fn credential_thumbnail(&self) -> Option<Vec<u8>> {
+        self.credentials
+            .as_ref()
+            .and_then(|report| report.active.thumbnail.clone())
+    }
+
     /// Compose at full resolution and encode. `encode_json` accepts
     /// `{"format":"jpeg","quality":85,"pngCompression":"default","background":[255,255,255]}`.
+    ///
+    /// `sign_json` requests Content Credentials. Empty means "do not sign";
+    /// otherwise it is a [`SignOptions`], and the caller supplies the clock and
+    /// the randomness because WebAssembly has neither.
     #[wasm_bindgen(js_name = renderExport)]
     pub fn render_export(
         &mut self,
         pipeline_json: &str,
         encode_json: &str,
+        sign_json: &str,
     ) -> Result<ExportResult, JsError> {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let request: EncodeRequest = if encode_json.trim().is_empty() {
@@ -198,7 +245,28 @@ impl Editor {
             png_compression: request.png_compression,
             background: request.background,
         };
-        let bytes = codec::encode(&rendered.image, format, &opts)?;
+        let mut bytes = codec::encode(&rendered.image, format, &opts)?;
+
+        let mut manifest_bytes = 0u32;
+        if !sign_json.trim().is_empty() {
+            let options: SignOptions =
+                serde_json::from_str(sign_json).map_err(|e| Error::Credentials(e.to_string()))?;
+
+            // Refusing rather than silently skipping. The caller only sets this
+            // when the user asked for a credential, and quietly handing back an
+            // unsigned file would be the one failure mode worth avoiding.
+            if !c2pa::supports_format(&request.format) {
+                return Err(Error::Credentials(format!(
+                    "Content Credentials can only be written to JPEG, not {}",
+                    request.format
+                ))
+                .into());
+            }
+
+            let signed = self.sign(&bytes, &pipeline, (width, height), &options)?;
+            manifest_bytes = u32::try_from(signed.embedded_len).unwrap_or(u32::MAX);
+            bytes = signed.jpeg;
+        }
 
         Ok(ExportResult {
             width,
@@ -206,8 +274,116 @@ impl Editor {
             mime: format.mime().to_string(),
             extension: format.extension().to_string(),
             bytes,
+            manifest_bytes,
         })
     }
+
+    /// Attach a manifest to freshly encoded JPEG bytes.
+    fn sign(
+        &mut self,
+        jpeg: &[u8],
+        pipeline: &Pipeline,
+        output: (u32, u32),
+        options: &SignOptions,
+    ) -> Result<c2pa::Signed, Error> {
+        // Something was opened in every case the editor supports - there is no
+        // "File > New" here - so the first action is always c2pa.opened and
+        // there is always a parentOf ingredient to point it at.
+        let actions = c2pa::actions_for(pipeline, true, output);
+
+        let parent = c2pa::Parent {
+            title: options.source_name.clone(),
+            format: options.source_mime.clone(),
+            instance_id: options.source_instance_id.clone(),
+            store: self.credentials.as_ref().map(|report| c2pa::ParentStore {
+                bytes: report.store.clone(),
+                active_manifest: report.active.label.clone(),
+                status: report.active.status.clone(),
+            }),
+        };
+
+        let thumbnail = if options.thumbnail {
+            self.thumbnail(pipeline)
+        } else {
+            None
+        };
+
+        let request = c2pa::SignRequest {
+            title: options.title.clone(),
+            generator: c2pa::generator(),
+            now: options.now.clone(),
+            instance_id: options.instance_id.clone(),
+            manifest_id: options.manifest_id.clone(),
+            actions,
+            parent: Some(parent),
+            thumbnail,
+        };
+
+        c2pa::sign_jpeg(jpeg, &request).map_err(Error::Credentials)
+    }
+
+    /// A small JPEG of the finished image for the `c2pa.thumbnail.claim`
+    /// assertion, so a viewer can show what was signed without decoding the
+    /// whole file. Failure here is not worth failing an export over - the
+    /// thumbnail is a convenience, not part of the binding.
+    fn thumbnail(&mut self, pipeline: &Pipeline) -> Option<Vec<u8>> {
+        // Rendering through the shared cache rather than a copy: the reduction
+        // ladder is already warm from the last preview, so a thumbnail costs
+        // almost nothing on top of the export that just ran.
+        let rendered = pipeline::render(
+            &mut self.source,
+            pipeline,
+            Target::Preview {
+                max_width: THUMBNAIL_MAX,
+                max_height: THUMBNAIL_MAX,
+            },
+        )
+        .ok()?;
+
+        codec::encode(
+            &rendered.image,
+            OutputFormat::Jpeg,
+            &EncodeOptions {
+                quality: 70,
+                png_compression: "default".to_string(),
+                background: [255, 255, 255],
+            },
+        )
+        .ok()
+    }
+}
+
+/// Longest edge of the thumbnail embedded in a manifest. Large enough to
+/// recognise the picture, small enough not to dominate the manifest.
+const THUMBNAIL_MAX: u32 = 256;
+
+/// What the host must supply to sign, since WebAssembly has neither a clock nor
+/// a random number generator. The browser has both, and passing them in also
+/// keeps signing reproducible for tests.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignOptions {
+    /// `dc:title` for the output.
+    title: String,
+    /// RFC 3339 timestamp for every action's `when`.
+    now: String,
+    /// `xmpMM:InstanceID` of the output, from `crypto.randomUUID()`.
+    instance_id: String,
+    /// `urn:c2pa:<uuid>` label for the new manifest.
+    manifest_id: String,
+    /// Name of the file that was opened, for the ingredient assertion.
+    #[serde(default)]
+    source_name: String,
+    #[serde(default = "default_source_mime")]
+    source_mime: String,
+    #[serde(default)]
+    source_instance_id: String,
+    #[serde(default)]
+    thumbnail: bool,
+}
+
+fn default_source_mime() -> String {
+    "image/jpeg".to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -302,6 +478,7 @@ pub struct ExportResult {
     mime: String,
     extension: String,
     bytes: Vec<u8>,
+    manifest_bytes: u32,
 }
 
 #[wasm_bindgen]
@@ -325,6 +502,11 @@ impl ExportResult {
     #[wasm_bindgen(getter, js_name = byteLength)]
     pub fn byte_length(&self) -> u32 {
         self.bytes.len() as u32
+    }
+    /// Bytes the Content Credential added to the file, or 0 if unsigned.
+    #[wasm_bindgen(getter, js_name = manifestBytes)]
+    pub fn manifest_bytes(&self) -> u32 {
+        self.manifest_bytes
     }
     /// Moves the encoded bytes out to JS, leaving this result empty.
     #[wasm_bindgen(js_name = takeBytes)]
@@ -377,11 +559,45 @@ pub fn capabilities() -> String {
     let filters_json: Vec<String> = filters.iter().map(|f| format!("\"{f}\"")).collect();
 
     format!(
-        "{{\"inputs\":[{}],\"outputs\":[{}],\"filters\":[{}],\"simd\":{},\"version\":\"{}\"}}",
+        "{{\"inputs\":[{}],\"outputs\":[{}],\"filters\":[{}],\"simd\":{},\"version\":\"{}\",\"contentCredentials\":{}}}",
         inputs_json.join(","),
         outputs_json.join(","),
         filters_json.join(","),
         cfg!(target_feature = "simd128"),
         env!("CARGO_PKG_VERSION"),
+        content_credentials_json(),
+    )
+}
+
+/// What this build can do with Content Credentials, and who it signs as.
+///
+/// The `untrusted` flag is not decoration. A browser claim generator publishes
+/// its signing key by existing, so the identity in every credential it writes
+/// is unverifiable, and the interface has to say so rather than showing a green
+/// tick. See `signing/README.md`.
+fn content_credentials_json() -> String {
+    let Ok(signer) = c2pa::signer::describe() else {
+        return "{\"available\":false}".to_string();
+    };
+
+    let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let usages: Vec<String> = signer
+        .extended_key_usage
+        .iter()
+        .map(|eku| format!("\"{}\"", escape(eku)))
+        .collect();
+
+    format!(
+        "{{\"available\":true,\"formats\":[\"jpeg\"],\"signer\":{{\
+         \"name\":\"{}\",\"organisation\":\"{}\",\"issuer\":\"{}\",\
+         \"expires\":\"{}\",\"algorithm\":\"ES256\",\"keyUsage\":[{}],\
+         \"untrusted\":{},\"timeStamped\":false,\"source\":\"{}\"}}}}",
+        escape(&signer.common_name),
+        escape(&signer.organisation),
+        escape(&signer.issuer),
+        escape(&signer.not_after),
+        usages.join(","),
+        signer.anchor_is_self_signed,
+        signer.credential_source,
     )
 }

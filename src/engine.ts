@@ -14,6 +14,7 @@ import type {
     ExportPayload,
     Pipeline,
     PreviewResult,
+    SignSpec,
     SourceInfo,
     WorkerRequest,
     WorkerResponse,
@@ -94,8 +95,16 @@ export class Engine {
         return response.source;
     }
 
-    async export(pipeline: Pipeline, encode: EncodeSpec): Promise<ExportPayload> {
-        const response = Engine.unwrap(await this.send({ kind: 'export', pipeline, encode }));
+    /**
+     * Render and encode. Passing `sign` also writes Content Credentials, which
+     * the engine rejects for any format but JPEG rather than silently dropping.
+     */
+    async export(
+        pipeline: Pipeline,
+        encode: EncodeSpec,
+        sign: SignSpec | null = null,
+    ): Promise<ExportPayload> {
+        const response = Engine.unwrap(await this.send({ kind: 'export', pipeline, encode, sign }));
         if (response.kind !== 'export') throw new Error('Unexpected reply from the image engine.');
         return response.result;
     }
