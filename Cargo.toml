@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/imagecore"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Keep dependency compile settings high even in dev so the WASM build is
+# usable when iterating locally.
+[profile.dev.package."*"]
+opt-level = 2
