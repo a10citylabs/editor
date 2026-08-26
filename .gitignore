@@ -12,3 +12,7 @@ target
 # Stray cargo-cyclonedx output, when sbom.sh is interrupted before it
 # collects the documents into conformance/evidence/.
 *.cdx.json
+
+# Python bytecode from the conformance scripts.
+__pycache__/
+*.pyc
