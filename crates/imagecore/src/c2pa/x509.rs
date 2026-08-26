@@ -130,14 +130,14 @@ fn decode_string(tlv: &Tlv<'_>) -> String {
             String::from_utf8_lossy(tlv.value).into_owned()
         }
         // BMPString and friends are UTF-16BE. Rare in practice; decoding them
-        // loosely beats showing mojibake.
+        // loosely beats showing mojibake. A trailing odd byte is dropped, which
+        // `as_chunks` gives for free by returning only the whole pairs.
         0x1E => tlv
             .value
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>()
+            .as_chunks::<2>()
+            .0
             .iter()
-            .filter_map(|c| char::from_u32(u32::from(*c)))
+            .filter_map(|pair| char::from_u32(u32::from(u16::from_be_bytes(*pair))))
             .collect(),
         _ => String::from_utf8_lossy(tlv.value).into_owned(),
     }
