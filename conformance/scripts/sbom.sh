@@ -39,10 +39,19 @@ fi
 # Products List records a Generator Product, and an assessor reading the
 # evidence needs to see which dependencies reach the signing key and which only
 # reach the pixels.
+#
+# `cargo cyclonedx` writes each document beside its own Cargo.toml and has no
+# output-directory option, so the files are collected afterwards rather than
+# redirected. `--all` means the full transitive graph; `--top-level` would list
+# only direct dependencies, which is not what an NVD scan needs to cover.
 (
     cd "$root"
-    cargo cyclonedx --format json --all --spec-version 1.5 --output-prefix "$out/"
+    cargo cyclonedx --format json --all --spec-version 1.5 --quiet
 )
+
+while IFS= read -r document; do
+    mv "$document" "$out/$(basename "$document")"
+done < <(find "$root/crates" "$root/services" -maxdepth 2 -name '*.cdx.json')
 
 echo "==> Web application (npm)"
 if [ -f "$root/package-lock.json" ]; then

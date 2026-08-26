@@ -60,11 +60,25 @@ PY
 )"
 echo "    validation time: $validation_time"
 
+# `|| true` on purpose. The harness exits 1 when an asset does not validate,
+# which is the right contract for `validate` - a caller asking "is this asset
+# good?" needs that in the exit status. But one of the samples is *meant* to
+# fail: `05-tampered-pixels` exists so the evidence shows what the validator
+# reports when a file has been altered, and the Program's own asset library is
+# full of assets like it. Generating evidence succeeds when the documents were
+# written, not when every asset was valid.
+expected="$(find "$assets" -maxdepth 1 \( -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l)"
 ./target/release/c2pa-harness batch \
     --asset-dir "$assets" \
     --output-dir "$out/crjson" \
     --trust-list conformance/test-credentials/c2pa-test-trust-list.pem \
     --tsa-trust-list conformance/test-credentials/c2pa-test-tsa-trust-list.pem \
-    --validation-time "$validation_time"
+    --validation-time "$validation_time" || true
 
-echo "==> wrote $(ls -1 "$out/crjson" | wc -l) crJSON document(s) into $out/crjson"
+written="$(find "$out/crjson" -maxdepth 1 -name '*.crjson' | wc -l)"
+if [ "$written" -ne "$expected" ]; then
+    echo "==> only $written of $expected assets produced crJSON" >&2
+    exit 1
+fi
+
+echo "==> wrote $written crJSON document(s) into $out/crjson"
