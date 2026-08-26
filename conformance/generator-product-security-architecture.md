@@ -354,6 +354,34 @@ is a change to one implementation and not to the service around it.
    stop reporting is marked `resolved` with a date rather than deleted, so how
    long each fix took is on the record.
 
+   The gate scores CVSS v3 vectors itself, because `cargo audit` reports the
+   vector — `CVSS:3.1/AV:N/AC:H/…` — and leaves the `severity` field null. An
+   earlier revision treated that as "severity unknown" and passed it, which
+   would have let a genuine CRITICAL through the one control this objective
+   rests on. `gate.py --self-test` checks the scorer against vectors with
+   published scores (Log4Shell 10.0, Heartbleed 7.5, and the `rsa` advisory
+   below at 5.9) and runs before every evaluation, so a scorer that stopped
+   working could not masquerade as a clean scan.
+
+3. **Open findings, and why they do not block.** One advisory is currently
+   outstanding, and it is worth stating rather than leaving an assessor to find
+   it in the SBOM:
+
+   | Finding | Severity | Disposition |
+   |---|---|---|
+   | `RUSTSEC-2023-0071` — Marvin Attack on `rsa` 0.9.10 | Medium (5.9) | Not reachable, and below the blocking threshold |
+   | `RUSTSEC-2025-0134` — `rustls-pemfile` unmaintained | Informational | Not a vulnerability; tracked, not blocking |
+
+   The Marvin Attack is a timing sidechannel on RSA *private-key* operations.
+   This product performs no RSA private-key operation anywhere: `rsa` is linked
+   only by `crates/imagecore/src/c2pa/verify.rs`, and only for
+   `RsaPublicKey`, `pkcs1v15::VerifyingKey` and `pss::VerifyingKey` — signature
+   *verification*, so that a manifest signed by an RSA-issued certificate can be
+   checked. No RSA private key type is linked into any binary in the workspace,
+   and the claim signing keys are ECDSA. The advisory has no patched release, so
+   removing the dependency would mean refusing to validate manifests from RSA
+   signers, which is a worse outcome than an unreachable Medium.
+
 #### 2.3.2 Assurance Level 2 Additional Evidence
 
 Not applicable at the target level. Noted for context: the Claim Generator is

@@ -63,21 +63,131 @@ def severity_of(cvss: float | None, label: str | None) -> str:
     return (label or "unknown").lower()
 
 
+# CVSS v3.1 base metric weights, from the specification's Table 15.
+_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+_AC = {"L": 0.77, "H": 0.44}
+_PR_UNCHANGED = {"N": 0.85, "L": 0.62, "H": 0.27}
+_PR_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.50}
+_UI = {"N": 0.85, "R": 0.62}
+_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+
+def _roundup(value: float) -> float:
+    """CVSS v3.1 Appendix A: round up to one decimal, without float surprises."""
+    scaled = int(round(value * 100_000))
+    if scaled % 10_000 == 0:
+        return scaled / 100_000.0
+    return (scaled // 10_000 + 1) / 10.0
+
+
+def cvss_v3_base_score(vector: str) -> float | None:
+    """Compute the base score from a CVSS v3 vector string.
+
+    ``cargo audit`` reports the *vector* — ``CVSS:3.1/AV:N/AC:H/...`` — and not
+    the score. An earlier version of this gate treated that as "severity
+    unknown", which let it pass anything cargo-audit reported: an advisory has
+    no ``severity`` label either, so a genuine CRITICAL would have sailed
+    through the one control O.3 and O.4 depend on. Scoring the vector is the
+    fix; guessing was never acceptable and neither was ignoring it.
+
+    Returns ``None`` for anything that is not a well-formed v3 vector, and the
+    caller treats that as unscored rather than as safe.
+    """
+    if not isinstance(vector, str) or not vector.startswith("CVSS:3"):
+        return None
+
+    metrics = {}
+    for part in vector.split("/")[1:]:
+        key, _, value = part.partition(":")
+        metrics[key] = value
+
+    try:
+        scope_changed = metrics["S"] == "C"
+        av = _AV[metrics["AV"]]
+        ac = _AC[metrics["AC"]]
+        pr = (_PR_CHANGED if scope_changed else _PR_UNCHANGED)[metrics["PR"]]
+        ui = _UI[metrics["UI"]]
+        confidentiality = _CIA[metrics["C"]]
+        integrity = _CIA[metrics["I"]]
+        availability = _CIA[metrics["A"]]
+    except KeyError:
+        return None
+
+    iss = 1 - ((1 - confidentiality) * (1 - integrity) * (1 - availability))
+    if scope_changed:
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+    else:
+        impact = 6.42 * iss
+    if impact <= 0:
+        return 0.0
+
+    exploitability = 8.22 * av * ac * pr * ui
+    combined = impact + exploitability
+    if scope_changed:
+        combined *= 1.08
+    return _roundup(min(combined, 10.0))
+
+
+def self_test() -> int:
+    """Check the scorer against vectors with published scores.
+
+    Run by ``vulnerability-scan.sh`` before every real evaluation, so the
+    control cannot quietly stop working: a scorer that returns ``None`` for
+    everything would make the gate pass unconditionally, and that failure looks
+    exactly like a clean scan.
+    """
+    cases = [
+        # RUSTSEC-2023-0071, the Marvin Attack on `rsa`.
+        ("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9, "medium"),
+        # CVE-2021-44228, Log4Shell.
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0, "critical"),
+        # CVE-2014-0160, Heartbleed.
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", 7.5, "high"),
+        # A vector with no impact at all scores zero.
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0, "low"),
+    ]
+
+    failures = 0
+    for vector, expected, band in cases:
+        score = cvss_v3_base_score(vector)
+        if score != expected:
+            print(f"self-test: {vector} scored {score}, expected {expected}", file=sys.stderr)
+            failures += 1
+        elif severity_of(score, None) != band:
+            print(
+                f"self-test: {vector} banded {severity_of(score, None)}, expected {band}",
+                file=sys.stderr,
+            )
+            failures += 1
+
+    # Malformed input must be unscored, never zero: "I could not read this" and
+    # "this is harmless" are different answers.
+    for junk in ["", "not a vector", "CVSS:2.0/AV:N/AC:L/Au:N/C:P/I:P/A:P", "CVSS:3.1/AV:X"]:
+        if cvss_v3_base_score(junk) is not None:
+            print(f"self-test: {junk!r} should not have scored", file=sys.stderr)
+            failures += 1
+
+    print("self-test: passed" if not failures else f"self-test: {failures} failure(s)")
+    return 1 if failures else 0
+
+
 def from_cargo_audit(report: dict) -> list[dict]:
     """Findings from ``cargo audit --json``."""
     findings = []
     for entry in report.get("vulnerabilities", {}).get("list", []) or []:
         advisory = entry.get("advisory", {}) or {}
         package = entry.get("package", {}) or {}
+        # cargo-audit reports the CVSS *vector*, not the score, and leaves
+        # `severity` null. Scoring it is what makes the 90-day gate mean
+        # anything: without this every cargo finding read as "unknown" and
+        # passed, CRITICAL ones included.
         cvss = advisory.get("cvss")
-        score = None
-        if isinstance(cvss, str) and "/" in cvss:
-            # cargo-audit gives the vector string, not the score. Without a
-            # parser the honest reading is "unknown", which the ledger can
-            # override with the real severity once a human has looked.
-            score = None
+        if isinstance(cvss, str):
+            score = cvss_v3_base_score(cvss)
         elif isinstance(cvss, (int, float)):
             score = float(cvss)
+        else:
+            score = None
         findings.append(
             {
                 "id": advisory.get("id", "unknown"),
@@ -143,7 +253,7 @@ def key_of(finding: dict) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ledger", required=True, type=pathlib.Path)
+    parser.add_argument("--ledger", type=pathlib.Path)
     parser.add_argument("--cargo-audit", type=pathlib.Path)
     parser.add_argument("--npm-audit", type=pathlib.Path)
     parser.add_argument("--report", type=pathlib.Path)
@@ -152,12 +262,23 @@ def main() -> int:
         action="store_true",
         help="record newly detected findings in the ledger and start their clock",
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the CVSS scorer against vectors with published scores, and exit",
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     findings = from_cargo_audit(load_json(args.cargo_audit)) + from_npm_audit(
         load_json(args.npm_audit)
     )
     current = {key_of(f): f for f in findings}
+
+    if not args.ledger:
+        parser.error("--ledger is required unless --self-test is given")
 
     ledger = {"findings": {}}
     if args.ledger.exists():
