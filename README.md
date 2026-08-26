@@ -6,14 +6,23 @@ edited and re-encoded inside the tab and never touches a server.
 
 JPEGs also get **C2PA Content Credentials**: the editor checks any credential
 already in the file, and can sign what it exports with a manifest recording
-every edit it made. That happens in the tab too — there is no signing service.
+every edit it made.
+
+Signing the *claim* happens on a small service, because the C2PA Conformance
+Program requires the signing key to be somewhere a browser cannot be. The
+picture is still never uploaded — what crosses the network is about a kilobyte
+of claim, and never a pixel. [Why, in one paragraph](#the-signing-key-is-not-in-your-browser).
 
 **Live:** [a10city.com/editor](https://a10city.com/editor)
 
 ```
   your file ──▶ Rust/WASM worker ──▶ your download
-                       ▲
-             nothing crosses the network
+                       │      ▲
+                       │      │  the image never leaves the tab
+                       │      │
+                 claim │      │ signature      (only when you ask for
+                       └──────┘                 Content Credentials)
+                     claim-signer
 ```
 
 ---
@@ -27,7 +36,7 @@ every edit it made. That happens in the tab too — there is no signing service.
 | **Crop** | Drag a selection on the preview, with rule-of-thirds guides, eight resize handles, ratio presets (1:1, 4:3, 16:9, 3:4, 9:16), keyboard nudging, and exact pixel fields. |
 | **Rotate** | Lossless 90° turns and mirror flips, plus a free straighten dial that expands the canvas instead of clipping the corners. |
 | **Adjust** | Brightness, contrast, saturation, unsharp mask, Gaussian blur, grayscale, invert. |
-| **Attest** | Read and verify C2PA Content Credentials on JPEG input; write a signed manifest on JPEG output recording what was done. Other formats are untouched — see [Content Credentials](#content-credentials). |
+| **Attest** | Validate C2PA Content Credentials on JPEG input, against a trust list where one is configured; write a signed, time-stamped manifest on JPEG output recording what was done. Other formats are untouched — see [Content Credentials](#content-credentials). |
 
 Extras that matter in practice: EXIF orientation is honoured so phone photos
 open upright, alpha is premultiplied around every resample so cut-outs do not
@@ -45,8 +54,12 @@ arrow keys nudge a selection (`Shift` for 10px), `Esc` clears it.
 [C2PA](https://spec.c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html)
 Content Credentials attach a signed, tamper-evident record of an image's history
 to the image itself. This editor is a working **claim generator** and
-**validator** for them, built against the 2.2 specification, running entirely in
-the browser.
+**validator** for them, built against the 2.2 specification, and shaped to pass
+the [C2PA Conformance Program][program] at Assurance Level 1 — see
+[`conformance/`](conformance/README.md) for the evidence and what is still
+outstanding.
+
+[program]: https://github.com/c2pa-org/conformance-public
 
 Open a JPEG and the panel says whether it carries a credential and whether that
 credential holds up. Export a JPEG and — if you leave the switch on — it gets a
@@ -125,59 +138,130 @@ implementation:
 $ c2patool signed.jpg
 validation_state : Valid
 success          : assertion.dataHash.match, assertion.hashedURI.match,
-                   claimSignature.insideValidity, claimSignature.validated
-failure          : signingCredential.untrusted
+                   claimSignature.insideValidity, claimSignature.validated,
+                   signingCredential.trusted, timeStamp.validated
 ```
 
-That last line is the honest one, and the next section is about it. Tamper with
-a signed file and both this validator and `c2patool` return
+Tamper with a signed file and both this validator and `c2patool` return
 `assertion.dataHash.mismatch`.
 
-### What a credential from this app does and does not prove
+The same validator, driven from the command line, produces
+[crJSON](https://spec.c2pa.org/specifications/specifications/2.4/crJSON/crjson-format.html) —
+the format the Conformance Program asks applicants to submit:
 
-A C2PA manifest supports two quite different claims, and only one of them
-survives here.
+```sh
+c2pa-harness validate --asset signed.jpg \
+    --trust-list c2pa-trust-list.pem \
+    --tsa-trust-list c2pa-tsa-trust-list.pem \
+    --validation-time 2026-08-27T08:30:12Z
+```
 
-**It does prove integrity.** The pixels have not changed since signing — that is
-the hard binding, and it is real. Alter one byte of image data and validation
-fails, in this app and in every other C2PA tool.
+Those four flags are exactly the four inputs the Program specifies. It is a
+front end over the code the browser runs, not a second implementation that could
+quietly disagree with it.
 
-**It does not prove identity.** The signing key is compiled into a WebAssembly
-module that is served to every visitor, so anyone can read it out and mint a
-manifest bearing this signer's name. There is no arrangement in which a purely
-client-side claim generator holds a secret key; that is a property of signing in
-the browser, not a shortcut taken here.
+### The signing key is not in your browser
 
-So the app never shows a tick beside a signer. It reports the two claims as two
-separate lines — integrity in green, identity as plain text naming who has
-vouched for the signer, which is nobody — and names the specification status
-code for every check so a reader can see exactly which guarantee they are being
-given. `signingCredential.untrusted` is displayed, not hidden.
+An earlier version of this editor compiled a signing key into the WebAssembly
+module. It was honest about the consequence — the interface said the identity
+was unverifiable, because anyone who loads the page can read the key out — but
+honesty is not conformance.
 
-**On GitHub secrets:** they cannot make a browser-side key secret. A secret is
-decrypted in the Actions runner, and whatever the runner bakes into `dist/` is
-downloadable. They are wired up anyway for the one real thing they buy — keeping
-a key out of public git history — so a fork can deploy under its own rotatable
-key by setting `C2PA_SIGNING_CERT` and `C2PA_SIGNING_KEY`. Without them the
-committed demo key is used, so a fresh clone builds and signs with no setup.
-[`signing/README.md`](signing/README.md) works through the reasoning and sketches
-the two designs — remote signing over a hash, or per-user certificates — that
-would produce credentials worth trusting without giving up the no-upload
-property.
+Objective **O.2** of the [C2PA Generator Product Security Requirements][gpsr]
+asks for a claim signing key that is encrypted at rest, encrypted in memory
+except while signing, access-controlled by least privilege, and rotatable. A key
+served to every visitor fails all four, and the failure is not a matter of
+degree: it put Assurance Level 1 — and therefore the Conforming Products List,
+and therefore any certificate a validator would recognise — permanently out of
+reach.
 
-### Not implemented, and why
+[gpsr]: https://github.com/c2pa-org/conformance-public/tree/main/docs/v0.2
 
-- **RFC 3161 time-stamps** (§10.3.2.5) and **stapled OCSP responses**
-  (§10.3.2.6). Both need a network round-trip to a third party while signing,
-  which an app whose premise is that nothing leaves the tab cannot make. Their
-  absence is reported in the UI rather than glossed over. It has a real cost: a
-  manifest without a time-stamp stops validating when its signing certificate
-  expires, which is why the demo certificate is dated twenty years out.
-- **Trust-list checking.** Deciding whether a signer is trustworthy needs a
-  trust anchor store; the app reports what a certificate says about itself and
-  states plainly that nothing has been checked against any list.
+So the key moved to [`services/claim-signer`](services/claim-signer/README.md),
+and the product became a **Distributed** implementation in the Program's terms:
+
+```text
+ Edge (your browser)                        Backend (claim-signer)
+ ───────────────────                        ──────────────────────────────
+ decode, edit, encode                       the only claim signing key
+ build the assertions and the claim         AES-256-GCM at rest, zeroised
+ compute the Sig_structure   ── TLS 1.3 ──▶ after each use
+ (~1 KB: no pixels)                         sign, then fetch a time-stamp
+ assemble and embed          ◀────────────  signature + TimeStampToken
+```
+
+The no-upload promise is unchanged, and it is now enforced rather than asserted:
+`conformance/scripts/check-no-key-material.sh` fails the build if the shipped
+`.wasm` contains a PEM private-key header, the bytes of the test key, or so much
+as a dependency edge on a private-key parser. It runs in CI and again before
+every deployment.
+
+Without a configured signer — which is the case on the plain GitHub Pages build,
+where there is no application server to mint a session credential — the editor
+works exactly as it always did and exports without a credential, and says so.
+There is no half-configured state and no button that fails.
+
+### What a credential from this app proves
+
+**Integrity.** The pixels have not changed since signing. That is the hard
+binding, and it is real: alter one byte of image data and validation fails, here
+and in every other C2PA tool.
+
+**What was done, and by what.** One action per operation the user actually
+performed, with the parameters that describe it, and `allActionsIncluded` set so
+a reader knows the list is complete. Every editing action carries the IPTC
+source type `humanEdits` — "augmentation, correction or enhancement by one or
+more humans using non-generative tools" — because that is exactly what this
+editor is. Nothing generative is ever claimed, and a test asserts it.
+
+**Identity — once there is a certificate.** The interface distinguishes three
+states rather than two, because they are genuinely different:
+
+| | Shown as |
+|---|---|
+| The chain reached an anchor on the configured trust list | the anchor's name |
+| A trust list was configured and the chain missed it | *not on the trust list* |
+| No trust list was configured | *not checked against any trust list* |
+
+Collapsing the middle case into either of the others is the failure C2PA exists
+to prevent — someone believing a picture because an interface told them to, or
+dismissing a good one because it said the wrong thing.
+
+Where the certificate carries them, the Assurance Level and the Conforming
+Products List record id are shown too, straight from the `c2pa-al` and
+`c2pa-cpl-record` extensions. Those two facts are what separate a conformant
+Generator Product from anything that can emit CBOR.
+
+### Time-stamps, and why they are not optional
+
+A C2PA claim signing certificate at Assurance Level 1 is capped at **366 days**.
+§15.8 judges an untimestamped manifest against the validity window *at the
+moment someone looks at it* — so without a time-stamp, every image this editor
+has ever signed would stop validating on the certificate's anniversary.
+
+With one, a validator judges the certificate at the attested time instead, and
+the credential stays good indefinitely. The Backend asks an RFC 3161 authority
+for a stamp over each signature (a 32-byte digest crosses that hop and nothing
+else), and the manifest reserves space for the token before it exists —
+`pad` and `pad2` in the COSE unprotected header, exactly as §10.4.2 and §10.4.4
+prescribe, shrunk to the byte once the real token arrives.
+
+When the authority is unreachable the file is still written, the interface says
+why there is no stamp, and the credential is valid until the certificate
+expires. Refusing to save someone's photograph because a third party was down
+would be the wrong trade.
+
+### Still not implemented, and why
+
+- **Stapled OCSP responses** (§10.3.2.6). Revocation status is reported as
+  `signingCredential.ocsp.skipped` rather than assumed either way. The Backend
+  is the right place to capture one, and it is the obvious next addition.
 - **Assertion salts** (`c2sh`), which matter for redaction. Boxes that arrive
   carrying one are preserved byte-for-byte so they still hash correctly.
+- **Ed25519 and P-521 signatures.** Both are on the specification's allowed
+  list; the validator reports them as *unsupported* rather than as invalid,
+  because a validator that says "this does not verify" when it means "I cannot
+  check this" is worse than one that admits the gap.
 - **Formats other than JPEG**, per the scope note above.
 
 ---
@@ -222,34 +306,60 @@ WebAssembly, and cannot be written. ICO is capped at 256×256 by the format.
 
 ## How it is put together
 
+The layout follows the Target of Evaluation boundary the C2PA Conformance
+Program cares about: what runs in the browser, what runs on a server, and what
+is evidence about the two.
+
 ```
-crates/imagecore/          the Rust engine
+apps/editor/               the Edge subsystem: the browser application
+  index.html
+  src/worker.ts            hosts the engine off the main thread, and drives signing
+  src/engine.ts            request correlation and preview coalescing
+  src/signer.ts            the claim-signer client (HMAC, identity, sign)
+  src/crop.ts              the interactive selection
+  src/credentials.ts       the Content Credentials panel
+  src/main.ts              control wiring
+  src/style.css            the A10city brand kit
+  src/editor.css           editor components
+
+crates/imagecore/          the Edge engine. No key material, by construction
   src/codec.rs             decode/encode, EXIF orientation, alpha flattening
   src/ops.rs               resampling, affine warp, tonal operators
   src/pipeline.rs          the edit pipeline and its resolution cache
   src/lib.rs               the wasm-bindgen surface
   src/c2pa/                the C2PA claim generator and validator
     cbor.rs                deterministic CBOR (RFC 8949 §4.2.1)
+    clock.rs               RFC 3339 and ASN.1 times as comparable instants
+    der.rs                 a small DER writer, for RFC 3161 requests
     jumbf.rs               JUMBF boxes (ISO/IEC 19566-5)
     jpegxt.rs              APP11 embedding and the hard-binding exclusions
-    x509.rs                enough DER to read a signing certificate
-    cose.rs                COSE_Sign1 over the claim (RFC 8152, RFC 9360)
-    signer.rs              the build's key material
-    manifest.rs            claims, assertions and validation
-  build.rs                 compiles the signing credentials in
+    x509.rs                RFC 5280, plus the C2PA Certificate Policy extensions
+    verify.rs              signature checking for every algorithm §13.2.1 allows
+    trust.rs               path validation against a C2PA Trust List
+    timestamp.rs           RFC 3161 tokens and §15.8 validation
+    identity.rs            the public half of the signing credential
+    cose.rs                COSE_Sign1, padding and sigTst2 (RFC 8152, RFC 9360)
+    manifest.rs            claims, assertions, prepare/complete, validation
+    crjson.rs              the crJSON serialisation of a validation result
+    testpki.rs             test fixtures, behind a feature no release enables
   tests/pipeline.rs        38 behavioural tests, run natively
-  tests/c2pa.rs            15 end-to-end signing and tamper tests
+  tests/c2pa.rs            28 end-to-end signing, trust and tamper tests
+  tests/evidence.rs        writes the conformance sample assets
 
-signing/                   the demo signing chain, and why it is public
+crates/c2pa-harness/       the conformance test harness: asset in, crJSON out
 
-src/                       the web app
-  worker.ts                hosts the engine off the main thread
-  engine.ts                request correlation and preview coalescing
-  crop.ts                  the interactive selection
-  credentials.ts           the Content Credentials panel
-  main.ts                  control wiring
-  style.css                the A10city brand kit
-  editor.css               editor components
+services/claim-signer/     the Backend subsystem: the only place a key exists
+  src/keystore.rs          sealed key storage, ephemeral use, rotation
+  src/auth.rs              authenticating the Edge (O.2)
+  src/tsa.rs               the RFC 3161 client
+  src/main.rs              TLS 1.3, routing, the signing endpoint
+
+conformance/               the evidence, and how to reproduce it
+  generator-product-security-architecture.md
+  requirements-matrix.md   every Level 1 requirement, and where it is met
+  enrolment-runbook.md     how to get a real certificate
+  test-credentials/        a test PKI shaped like the real thing
+  scripts/                 SBOM, the 90-day gate, the no-key check, evidence
 ```
 
 ### Edits are declarative, and replayed
@@ -320,9 +430,40 @@ npm run dev        # builds the engine, then serves with hot reload
 | `npm run dev` | Build the engine and serve locally |
 | `npm run build` | Production build into `dist/` |
 | `npm run build:wasm` | Rebuild only the WebAssembly engine |
-| `npm test` | Run the engine's test suite |
+| `npm test` | Run the whole Rust workspace's test suite |
 | `npm run typecheck` | Type-check the web app |
-| `./signing/generate.sh` | Regenerate the demo signing chain |
+| `npm run sbom` | Software Bill of Materials for every component |
+| `npm run audit:supply-chain` | The 90-day CRITICAL/HIGH gate |
+| `./conformance/scripts/generate-evidence.sh` | Sample assets and their crJSON |
+| `./conformance/scripts/check-no-key-material.sh` | Prove the bundle holds no key |
+| `./conformance/test-credentials/generate.sh` | Regenerate the test PKI |
+
+### Running with a signer
+
+The editor works without one — it just exports unsigned. To exercise the whole
+path locally:
+
+```sh
+cargo run -p claim-signer -- import \
+    --id dev --key conformance/test-credentials/c2pa-test-claim-signer.key \
+    --chain conformance/test-credentials/c2pa-test-claim-signer-chain.pem
+cargo run -p claim-signer -- activate --id dev
+CLAIM_SIGNER_ALLOW_PLAINTEXT=1 cargo run -p claim-signer -- serve
+```
+
+with `CLAIM_SIGNER_KEYSTORE`, `CLAIM_SIGNER_KEK` and `CLAIM_SIGNER_CLIENTS` set
+— see [`services/claim-signer/README.md`](services/claim-signer/README.md).
+Then put a `claim-signer.json` in `apps/editor/public/`:
+
+```json
+{
+  "url": "http://localhost:8443",
+  "credential": { "keyId": "dev", "secret": "<the same base64 secret>" }
+}
+```
+
+`CLAIM_SIGNER_ALLOW_PLAINTEXT` is a development-only escape hatch and logs a
+warning naming the conformance objective it violates every time it starts.
 
 To check the credentials against something other than this code, install the
 reference tool and point it at a JPEG the app exported:
@@ -332,16 +473,22 @@ cargo install c2patool
 c2patool ~/Downloads/photo-edited.jpg
 ```
 
-Expect `"validation_state": "Valid"` with `signingCredential.untrusted` as the
-only failure — see [Content Credentials](#content-credentials) for why that is
+Expect `"validation_state": "Valid"`. With the test PKI, `signingCredential.untrusted`
+appears unless you also point `c2patool` at
+`conformance/test-credentials/c2pa-test-trust-list.pem`; see
+[Content Credentials](#content-credentials) for why that is
 the correct result rather than a bug.
 
-`src/wasm/` is build output and is not committed; `npm run dev` and
-`npm run build` regenerate it.
+`apps/editor/src/wasm/` and `conformance/evidence/` are build output and are not
+committed; `npm run dev`, `npm run build` and `generate-evidence.sh` regenerate
+them.
 
 Pushes to `main` deploy to GitHub Pages via `.github/workflows/deploy.yml`.
-Pull requests run formatting, Clippy, the test suite, a WebAssembly build and a
-full site build via `.github/workflows/ci.yml`.
+Pull requests run four jobs via `.github/workflows/ci.yml`: formatting, Clippy
+and the workspace test suite; the conformance evidence; the SBOM and the 90-day
+vulnerability gate; and a full site build. The deploy workflow re-runs the
+vulnerability gate *before* building and the no-key-material check *after*,
+because a gate that only advises is not a gate.
 
 ---
 
@@ -352,11 +499,20 @@ decoded, edited and encoded in a Web Worker in your own tab. The only network
 requests the page makes are for its own assets, Google Fonts, and A10city's
 privacy-first analytics — none of which sees your image.
 
-Signing does not change that. The manifest is built and signed in the same
-worker, with a key compiled into the WebAssembly module, so a Content Credential
-costs no network request either. The trade is the one described above: a key
-that lives in the browser is a key everyone has, so these credentials prove that
-an image is unaltered and not who made it.
+Signing changes it by about a kilobyte, in one direction, and only when you ask
+for a credential. The worker builds the manifest and computes a `Sig_structure`
+— the claim, the certificate chain and a context string — and sends *that* to
+the claim-signer. The image is not in it, and a test asserts as much: no run of
+image bytes appears in what is sent, and the whole payload is a fraction of the
+file's size.
+
+The signing service therefore learns that someone signed a claim, and what that
+claim says. It never sees the picture. The time-stamping authority beyond it
+sees less again: 32 bytes of digest.
+
+This is the trade that buys a credential worth believing. The alternative — a
+key in the page — costs no network request at all and proves nothing about who
+made the image, because everyone who loads the page has the key.
 
 Note that a credential is *content* — the actions assertion records what you did
 to the picture, and the ingredient assertion records the filename you opened.

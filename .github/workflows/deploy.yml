@@ -41,8 +41,16 @@ jobs:
         with:
           version: 'latest'
 
-      - name: Test the image engine
-        run: cargo test -p imagecore
+      - name: Test the workspace
+        run: cargo test --workspace
+
+      # O.3 and O.4 at Assurance Level 1 require that the pipeline refuse to
+      # release a Claim Generator carrying a CRITICAL or HIGH vulnerability more
+      # than 90 days after detection. This is the point in the pipeline where
+      # that refusal has to happen, so the gate runs before the build, not
+      # alongside it.
+      - name: Supply-chain gate
+        run: ./conformance/scripts/vulnerability-scan.sh
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -53,21 +61,40 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # The signing credentials for Content Credentials. When both secrets are
-      # set, `crates/imagecore/build.rs` compiles them into the engine instead
-      # of the demo key committed under `signing/`; when they are absent, as on
-      # a fork, the demo key is used and the build still works.
-      #
-      # To be clear about what this buys: a secret keeps a key out of public git
-      # history. It cannot make the key secret. This engine is served to
-      # browsers, so whichever key it carries is published along with it. See
-      # `signing/README.md` for why that is inherent to client-side signing and
-      # what a trustworthy setup would look like instead.
       - name: Build
         run: npm run build
-        env:
-          C2PA_SIGNING_CERT: ${{ secrets.C2PA_SIGNING_CERT }}
-          C2PA_SIGNING_KEY: ${{ secrets.C2PA_SIGNING_KEY }}
+
+      # The property this whole architecture exists to preserve. Checked against
+      # the artefact that is about to be published, not against the source.
+      - name: Check the published module carries no key material
+        run: ./conformance/scripts/check-no-key-material.sh
+
+      # The C2PA Trust List and the TSA Trust List, if this deployment ships
+      # them. The editor fetches both at run time and falls back to reporting
+      # signer identity as unchecked when they are absent, so an unset variable
+      # degrades the interface rather than breaking it.
+      - name: Publish the trust lists
+        if: vars.C2PA_TRUST_LIST_URL != ''
+        run: |
+          mkdir -p dist/trust-lists
+          curl -fsSL "${{ vars.C2PA_TRUST_LIST_URL }}" -o dist/trust-lists/c2pa-trust-list.pem
+          if [ -n "${{ vars.C2PA_TSA_TRUST_LIST_URL }}" ]; then
+            curl -fsSL "${{ vars.C2PA_TSA_TRUST_LIST_URL }}" \
+              -o dist/trust-lists/c2pa-tsa-trust-list.pem
+          fi
+
+      # Where the claim-signer lives, for a deployment that has one. Absent on
+      # the plain GitHub Pages build: there is no application server there to
+      # mint a session credential, so the editor runs without signing and says
+      # so. Note what is *not* here any more — no signing key, no certificate,
+      # no secret of any kind reaches the published bundle.
+      - name: Publish the claim-signer configuration
+        if: vars.CLAIM_SIGNER_URL != ''
+        run: |
+          printf '{"url":"%s","credentialEndpoint":"%s"}\n' \
+            "${{ vars.CLAIM_SIGNER_URL }}" \
+            "${{ vars.EDGE_CREDENTIAL_ENDPOINT }}" \
+            > dist/claim-signer.json
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

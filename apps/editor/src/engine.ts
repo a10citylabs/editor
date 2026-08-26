@@ -14,8 +14,11 @@ import type {
     ExportPayload,
     Pipeline,
     PreviewResult,
+    SignerConfig,
+    SignerDescription,
     SignSpec,
     SourceInfo,
+    ValidationRequest,
     WorkerRequest,
     WorkerResponse,
 } from './types';
@@ -86,18 +89,41 @@ export class Engine {
         return response.capabilities;
     }
 
-    async open(file: File): Promise<SourceInfo> {
+    async open(file: File, validation: ValidationRequest): Promise<SourceInfo> {
         const bytes = await file.arrayBuffer();
         const response = Engine.unwrap(
-            await this.send({ kind: 'open', bytes, name: file.name, type: file.type }, [bytes]),
+            await this.send(
+                { kind: 'open', bytes, name: file.name, type: file.type, validation },
+                [bytes],
+            ),
         );
         if (response.kind !== 'open') throw new Error('Unexpected reply from the image engine.');
         return response.source;
     }
 
     /**
+     * Point the engine at a claim-signer, or at nothing.
+     *
+     * Returns what the certificate says about the signer, or the reason it
+     * could not be reached. Both are useful to show; conflating them would
+     * leave a user unable to tell a deployment without credentials from a
+     * credential service that is down.
+     */
+    async connectSigner(
+        config: SignerConfig | null,
+    ): Promise<{ identity: SignerDescription | null; problem: string | null }> {
+        const response = Engine.unwrap(await this.send({ kind: 'signer', config }));
+        if (response.kind !== 'signer') throw new Error('Unexpected reply from the image engine.');
+        return { identity: response.identity, problem: response.problem };
+    }
+
+    /**
      * Render and encode. Passing `sign` also writes Content Credentials, which
      * the engine rejects for any format but JPEG rather than silently dropping.
+     *
+     * A signed export makes a network round trip to the claim-signer in the
+     * middle, so it takes longer than an unsigned one and can fail for reasons
+     * that have nothing to do with the image.
      */
     async export(
         pipeline: Pipeline,

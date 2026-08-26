@@ -8,44 +8,61 @@
 //! built, which cannot happen until the hash exists.
 //!
 //! Section 10.4 of the specification breaks the loop with exclusion ranges and
-//! fixed-width placeholders. This module does it in two renders:
+//! fixed-width placeholders. Signing happens on a different machine, which adds
+//! a second seam: the claim has to be finished and handed out before the
+//! signature comes back. So the flow is three renders across two calls:
 //!
 //! ```text
-//!   render 1     everything real except: hash = 32 zero bytes
-//!                                        exclusion = (0, 0)
-//!                                        signature = 64 zero bytes
-//!                       │
-//!                       ├── gives the store's exact final size, because every
-//!                       │   placeholder is the same width as the real value
-//!                       ▼
-//!   measure      exclusion = (insertion offset, embedded length)
-//!                hash      = SHA-256 of the file with that range removed,
-//!                            which is just head ++ tail
-//!                       │
-//!                       ▼
-//!   render 2     the same manifest with real values substituted in, asserted
-//!                to be byte-for-byte the same length as render 1
+//!   prepare ─┬─ render 1   everything real except: hash = 32 zero bytes
+//!            │                                     exclusion = (0, 0)
+//!            │                                     signature = a placeholder
+//!            │                   │
+//!            │                   ├── gives the store's exact final size,
+//!            │                   │   because the signature box is reserved at
+//!            │                   │   a fixed width whatever comes back
+//!            │                   ▼
+//!            ├─ measure    exclusion = (insertion offset, embedded length)
+//!            │             hash      = SHA-256 of the file with that range
+//!            │                         removed - head ++ tail
+//!            │                   │
+//!            │                   ▼
+//!            └─ render 2   the same manifest with the real hash, still with
+//!                          the placeholder signature. Its claim bytes are what
+//!                          gets signed.
+//!                                │
+//!                   ═════════════╪═════════  the Backend signs, and asks a
+//!                                │           time-stamping authority to stamp
+//!                                ▼           the signature
+//!   complete ── render 3   identical again, with the real COSE_Sign1 padded
+//!                          back to the reserved width, then embedded
 //! ```
 //!
-//! Three properties make the placeholders exact, and each is enforced rather
+//! Four properties make the placeholders exact, and each is enforced rather
 //! than assumed:
 //!
 //! - `start` and `length` are written as 32-bit CBOR integers whatever their
 //!   value ([`cbor::Value::Uint32`]). Section 18.5.2 asks for precisely this.
-//! - SHA-256 is always 32 bytes and an ES256 signature always 64.
+//! - SHA-256 is always 32 bytes, and the signature length is fixed by the
+//!   algorithm in the signing identity.
+//! - The time-stamp, whose size nobody can predict, sits in a reserved slot the
+//!   COSE `pad` field shrinks to absorb — see [`super::cose`].
 //! - Every value that would otherwise vary between renders — timestamps, the
 //!   instance ID, the manifest URN — is computed once by the caller and passed
-//!   in, so the two renders differ only where they are meant to.
+//!   in, so the renders differ only where they are meant to.
 //!
-//! The final `debug_assert_eq!` on the two lengths is the backstop. If a future
+//! The `debug_assert_eq!` on the render lengths is the backstop. If a future
 //! change breaks one of those properties, it fails there rather than producing
 //! a manifest whose offsets are quietly wrong.
 
 use sha2::{Digest, Sha256};
 
 use super::cbor::Value;
+use super::clock::{self, Instant};
+use super::identity::SigningIdentity;
 use super::jumbf::{self, Child, Superbox};
-use super::{cose, jpegxt, signer, x509};
+use super::timestamp::{self, Verdict};
+use super::trust::{self, Purpose, TrustStore};
+use super::{cose, jpegxt, x509};
 
 /// The hash algorithm identifier used throughout, from the C2PA registry.
 const ALG: &str = "sha256";
@@ -94,14 +111,23 @@ fn assertion_uri(assertion: &Superbox) -> Value {
 pub struct GeneratorInfo {
     pub name: String,
     pub version: String,
+    /// The specification version this manifest was produced to.
+    ///
+    /// The Conformance Program requires this to match the version on the
+    /// product's Conforming Products List record — see [`super::SPEC_VERSION`].
+    pub spec_version: Option<String>,
 }
 
 impl GeneratorInfo {
     fn to_value(&self) -> Value {
-        Value::Map(vec![
+        let mut fields = vec![
             (Value::text("name"), Value::text(self.name.clone())),
             (Value::text("version"), Value::text(self.version.clone())),
-        ])
+        ];
+        if let Some(spec) = &self.spec_version {
+            fields.push((Value::text("specVersion"), Value::text(spec.clone())));
+        }
+        Value::Map(fields)
     }
 }
 
@@ -112,6 +138,9 @@ pub struct Action {
     pub action: String,
     /// Free text shown to a person; important for entity-specific actions.
     pub description: Option<String>,
+    /// The IPTC digital source type. Mandatory on most predefined actions and
+    /// forbidden on `c2pa.opened` — see [`super::requires_digital_source_type`].
+    pub digital_source_type: Option<String>,
     /// Extra `parameters-map-v2` entries, e.g. the new dimensions of a resize.
     pub parameters: Vec<(String, Value)>,
 }
@@ -121,12 +150,18 @@ impl Action {
         Action {
             action: action.into(),
             description: None,
+            digital_source_type: None,
             parameters: Vec::new(),
         }
     }
 
     pub fn describe(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    pub fn source_type(mut self, source_type: impl Into<String>) -> Self {
+        self.digital_source_type = Some(source_type.into());
         self
     }
 
@@ -160,8 +195,8 @@ pub struct ParentStore {
 /// supplied by the caller.
 ///
 /// The host owning the clock and the randomness is not an accident of the
-/// wasm target having neither: it is also what makes the two renders described
-/// at the top of this module produce identical bytes, and what makes the tests
+/// wasm target having neither: it is also what makes the renders described at
+/// the top of this module produce identical bytes, and what makes the tests
 /// reproducible.
 #[derive(Clone, Debug)]
 pub struct SignRequest {
@@ -192,6 +227,12 @@ struct Blueprint<'a> {
     /// `c2pa.ingredient.v3`, when something was opened.
     ingredient: Option<Superbox>,
     thumbnail: Option<Superbox>,
+}
+
+/// One render: the finished store, plus the claim bytes inside it.
+struct Rendered {
+    store: Vec<u8>,
+    claim: Vec<u8>,
 }
 
 impl<'a> Blueprint<'a> {
@@ -227,13 +268,9 @@ impl<'a> Blueprint<'a> {
     }
 
     /// Render the whole store. `hash` and `exclusion` fill the hard binding;
-    /// `sign` turns claim bytes into a `COSE_Sign1`.
-    fn render(
-        &self,
-        hash: &[u8],
-        exclusion: (u32, u32),
-        sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-    ) -> Result<Vec<u8>> {
+    /// `signature_box` is the serialised `COSE_Sign1`, real or placeholder, and
+    /// must be the same length in every render.
+    fn render(&self, hash: &[u8], exclusion: (u32, u32), signature_box: &[u8]) -> Rendered {
         let mut assertions: Vec<Superbox> = Vec::new();
         if let Some(thumbnail) = &self.thumbnail {
             assertions.push(thumbnail.clone());
@@ -249,21 +286,19 @@ impl<'a> Blueprint<'a> {
             store_box.push(Child::Super(assertion.clone()));
         }
 
-        let claim = self.build_claim(&assertions);
-        let claim_bytes = claim.encode();
-        let signature = sign(&claim_bytes)?;
+        let claim_bytes = self.build_claim(&assertions).encode();
 
         let manifest = Superbox::new(jumbf::UUID_MANIFEST, self.request.manifest_id.clone())
             .with_child(Child::Super(store_box))
             .with_child(Child::Super(Superbox::cbor(
                 jumbf::UUID_CLAIM,
                 LABEL_CLAIM,
-                claim_bytes,
+                claim_bytes.clone(),
             )))
             .with_child(Child::Super(Superbox::cbor(
                 jumbf::UUID_SIGNATURE,
                 LABEL_SIGNATURE,
-                signature,
+                signature_box.to_vec(),
             )));
 
         let mut store = Superbox::new(jumbf::UUID_MANIFEST_STORE, "c2pa");
@@ -273,7 +308,10 @@ impl<'a> Blueprint<'a> {
         // The active manifest is the last one in the store (section 11.1.2).
         store.push(Child::Super(manifest));
 
-        Ok(store.to_bytes())
+        Rendered {
+            store: store.to_bytes(),
+            claim: claim_bytes,
+        }
     }
 
     fn build_actions(&self) -> Superbox {
@@ -293,6 +331,12 @@ impl<'a> Blueprint<'a> {
 
             if let Some(description) = &action.description {
                 fields.push((Value::text("description"), Value::text(description.clone())));
+            }
+            if let Some(source_type) = &action.digital_source_type {
+                fields.push((
+                    Value::text("digitalSourceType"),
+                    Value::text(source_type.clone()),
+                ));
             }
 
             let mut parameters: Vec<(Value, Value)> = action
@@ -328,7 +372,9 @@ impl<'a> Blueprint<'a> {
                 Value::Array(vec![self.request.generator.to_value()]),
             ),
             // The editor knows every operation it performed, so it can say so.
-            // Section 18.10: this asserts nothing else happened off the record.
+            // Section 18.10 makes this optional; the Conformance Program makes
+            // it mandatory, because an asset rubric cannot classify provenance
+            // that might be incomplete without saying which it is.
             (Value::text("allActionsIncluded"), Value::Bool(true)),
         ]);
 
@@ -453,20 +499,54 @@ pub struct Signed {
     pub manifest_len: usize,
     /// Total bytes the credential added to the file.
     pub embedded_len: usize,
+    /// Whether the finished signature carries a time-stamp.
+    pub time_stamped: bool,
 }
 
-/// Sign a JPEG: build a manifest for it, and embed the result.
-pub fn sign_jpeg(jpeg: &[u8], request: &SignRequest) -> Result<Signed> {
-    let credentials = signer::load()?;
-    let blueprint = Blueprint::new(request)?;
+/// A manifest built up to the point where only a signature is missing.
+///
+/// Holding the stripped JPEG and the request means [`complete`] reproduces
+/// exactly the bytes [`prepare`] measured, which is what keeps the hard
+/// binding's offsets correct across the network round trip in between.
+pub struct Prepared {
+    request: SignRequest,
+    identity: SigningIdentity,
+    plan: jpegxt::InsertionPlan,
+    hash: Vec<u8>,
+    exclusion: (u32, u32),
+    reserved: usize,
+    embedded_len: usize,
+    /// The `Sig_structure` the Backend signs. This is the *only* thing that
+    /// leaves the tab: a few hundred bytes of claim, never the image.
+    pub to_be_signed: Vec<u8>,
+    /// The claim as it will appear in the file, for callers that want to show
+    /// what is about to be signed.
+    pub claim: Vec<u8>,
+}
 
-    // Render 1 measures. Placeholders are the same width as real values, so
+impl Prepared {
+    /// How much room the time-stamp has. A caller that gets
+    /// [`cose::ERR_RESERVATION_TOO_SMALL`] back from [`complete`] should prepare
+    /// again with more than this.
+    pub fn timestamp_budget(&self) -> usize {
+        self.identity.timestamp_budget
+    }
+}
+
+/// Build a manifest for `jpeg` and stop just short of signing it.
+pub fn prepare(jpeg: &[u8], request: SignRequest, identity: SigningIdentity) -> Result<Prepared> {
+    let reserved = cose::reserved_len(&identity).map_err(|e| e.to_string())?;
+    let placeholder = cose::placeholder(&identity).map_err(|e| e.to_string())?;
+    debug_assert_eq!(placeholder.len(), reserved);
+
+    let blueprint = Blueprint::new(&request)?;
+
+    // Render 1 measures. The signature box is reserved at its final width, so
     // this size is final.
-    let placeholder_signature = cose::placeholder(&credentials.chain).map_err(|e| e.to_string())?;
-    let measured = blueprint.render(&[0u8; 32], (0, 0), &|_| Ok(placeholder_signature.clone()))?;
+    let measured = blueprint.render(&[0u8; 32], (0, 0), &placeholder);
 
     let plan = jpegxt::plan_insertion(jpeg).map_err(|e| e.to_string())?;
-    let embedded_len = jpegxt::embedded_length(measured.len());
+    let embedded_len = jpegxt::embedded_length(measured.store.len());
 
     let exclusion = (
         u32::try_from(plan.offset).map_err(|_| "the JPEG is too large to sign".to_string())?,
@@ -482,27 +562,80 @@ pub fn sign_jpeg(jpeg: &[u8], request: &SignRequest) -> Result<Signed> {
     binding.update(&plan.stripped[plan.offset..]);
     let hash = binding.finalize().to_vec();
 
-    // Render 2 substitutes the real values in.
-    let store = blueprint.render(&hash, exclusion, &|claim_bytes| {
-        cose::sign(claim_bytes, &credentials.key, &credentials.chain).map_err(|e| e.to_string())
-    })?;
+    // Render 2 substitutes the real hard binding in. Its claim is what gets
+    // signed.
+    let rendered = blueprint.render(&hash, exclusion, &placeholder);
+    if rendered.store.len() != measured.store.len() {
+        return Err("the manifest changed size while being prepared".into());
+    }
+
+    let protected = cose::protected_bytes(&identity);
+    let to_be_signed = cose::sig_structure(&protected, &rendered.claim);
+
+    Ok(Prepared {
+        request,
+        identity,
+        plan,
+        hash,
+        exclusion,
+        reserved,
+        embedded_len,
+        to_be_signed,
+        claim: rendered.claim,
+    })
+}
+
+/// Finish a prepared manifest with the signature the Backend returned, and
+/// embed it.
+///
+/// `timestamp_token` is the DER `TimeStampToken` from the time-stamping
+/// authority, or `None` when the Backend could not obtain one — in which case
+/// the manifest is written anyway and the reserved space becomes padding. A
+/// missing time-stamp costs long-term validity, not validity today, and
+/// refusing to save the image over it would be the wrong trade.
+pub fn complete(
+    prepared: &Prepared,
+    signature: &[u8],
+    timestamp_token: Option<&[u8]>,
+) -> Result<Signed> {
+    let expected = prepared.identity.signature_len();
+    if signature.len() != expected {
+        return Err(format!(
+            "the signer returned {} bytes, but a {} signature is {expected}",
+            signature.len(),
+            super::identity::alg::name(prepared.identity.algorithm)
+        ));
+    }
+
+    let protected = cose::protected_bytes(&prepared.identity);
+    let signature_box = cose::assemble(
+        &protected,
+        signature,
+        timestamp_token,
+        Some(prepared.reserved),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let blueprint = Blueprint::new(&prepared.request)?;
+    let rendered = blueprint.render(&prepared.hash, prepared.exclusion, &signature_box);
 
     // If this ever fires, a placeholder stopped matching the width of the value
     // it stands in for, and every offset in the hard binding is wrong.
     debug_assert_eq!(
-        store.len(),
-        measured.len(),
+        jpegxt::embedded_length(rendered.store.len()),
+        prepared.embedded_len,
         "manifest size changed between renders"
     );
-    if store.len() != measured.len() {
+    if jpegxt::embedded_length(rendered.store.len()) != prepared.embedded_len {
         return Err("the manifest changed size while being signed".into());
     }
 
-    let signed = jpegxt::embed(&plan, &store).map_err(|e| e.to_string())?;
+    let signed = jpegxt::embed(&prepared.plan, &rendered.store).map_err(|e| e.to_string())?;
     Ok(Signed {
         jpeg: signed,
-        manifest_len: store.len(),
-        embedded_len,
+        manifest_len: rendered.store.len(),
+        embedded_len: prepared.embedded_len,
+        time_stamped: timestamp_token.is_some(),
     })
 }
 
@@ -556,6 +689,39 @@ impl StatusCodes {
     pub fn is_valid(&self) -> bool {
         self.failure.is_empty()
     }
+
+    fn extend(&mut self, other: StatusCodes) {
+        self.success.extend(other.success);
+        self.informational.extend(other.informational);
+        self.failure.extend(other.failure);
+    }
+}
+
+/// What a validator was given to work with.
+///
+/// These are exactly the inputs the Conformance Program's test harness has to
+/// accept: an asset, a C2PA Trust List, a C2PA TSA Trust List, and a validation
+/// time. Nothing here is discovered at run time, which is what makes a
+/// validation run reproducible and its crJSON output comparable.
+#[derive(Clone, Debug)]
+pub struct ValidationOptions {
+    pub trust: TrustStore,
+    pub tsa_trust: TrustStore,
+    /// RFC 3339 instant to judge certificate validity at, when no trusted
+    /// time-stamp overrides it.
+    pub validation_time: Instant,
+}
+
+impl ValidationOptions {
+    /// Validation with no trust lists: the signature and the hashes are
+    /// checked, and every signer is reported untrusted.
+    pub fn untrusted(validation_time: Instant) -> Self {
+        ValidationOptions {
+            trust: TrustStore::empty(),
+            tsa_trust: TrustStore::empty(),
+            validation_time,
+        }
+    }
 }
 
 /// One action, as read back out of a manifest.
@@ -566,6 +732,7 @@ pub struct ReadAction {
     pub when: String,
     pub description: String,
     pub software_agent: String,
+    pub digital_source_type: String,
 }
 
 /// What a manifest says, and what checking it produced.
@@ -576,6 +743,8 @@ pub struct ManifestReport {
     pub title: String,
     pub instance_id: String,
     pub generator: String,
+    /// The `specVersion` the generator declared, when it declared one.
+    pub spec_version: String,
     pub claim_version: u8,
     pub actions: Vec<ReadAction>,
     pub ingredients: Vec<IngredientReport>,
@@ -587,6 +756,21 @@ pub struct ManifestReport {
     #[serde(skip)]
     pub thumbnail: Option<Vec<u8>>,
     pub status: StatusCodes,
+    /// The decoded claim and assertions, kept for the crJSON serialiser. Not
+    /// part of the JSON the interface receives — it would double its size for
+    /// no reader's benefit.
+    #[serde(skip)]
+    pub raw: RawManifest,
+}
+
+/// The manifest as CBOR, for serialisations that need the whole thing.
+#[derive(Clone, Debug, Default)]
+pub struct RawManifest {
+    pub claim: Option<Value>,
+    pub claim_label: String,
+    pub assertions: Vec<(String, Option<Value>)>,
+    pub chain: Vec<Vec<u8>>,
+    pub timestamp_token: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -596,9 +780,21 @@ pub struct SignatureReport {
     pub issuer: String,
     pub subject: String,
     pub subject_organisation: String,
+    pub serial_number: String,
     pub not_before: String,
     pub not_after: String,
+    /// The attested time, when a trusted time-stamp was found.
     pub time_stamped: bool,
+    pub time_stamp: String,
+    pub time_stamp_authority: String,
+    /// Whether the chain reached an anchor on the supplied C2PA Trust List.
+    pub trusted: bool,
+    pub trust_anchor: String,
+    /// From the `c2pa-al` extension: the Assurance Level the Conformance
+    /// Program granted the Generator Product that signed this.
+    pub assurance_level: Option<u32>,
+    /// From the `c2pa-cpl-record` extension.
+    pub cpl_record_id: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -623,6 +819,9 @@ pub struct ValidationReport {
     #[serde(skip)]
     pub store: Vec<u8>,
     pub store_len: usize,
+    /// The instant validation was performed at, echoed so a report can be
+    /// reproduced.
+    pub validation_time: String,
 }
 
 impl ValidationReport {
@@ -638,18 +837,26 @@ impl ValidationReport {
 
     /// Whether the file passed every check that was applied.
     ///
-    /// Trust is deliberately not part of this. A validator with no trust anchor
-    /// store cannot say whether a signer should be believed, only whether the
-    /// bytes are intact and the signature is internally consistent.
+    /// Trust is part of this only when a trust list was supplied: with no list,
+    /// the signer is reported as unverified in the informational codes and the
+    /// integrity result stands on its own.
     pub fn is_valid(&self) -> bool {
         self.active.status.is_valid()
     }
 }
 
+/// Read and check the Content Credentials in a JPEG, with no trust list.
+///
+/// `now` is what certificate validity is judged against. WebAssembly has no
+/// clock, so the host supplies it — which also makes every test reproducible.
+pub fn read_jpeg(jpeg: &[u8], now: Instant) -> Result<Option<ValidationReport>> {
+    validate_jpeg(jpeg, &ValidationOptions::untrusted(now))
+}
+
 /// Read and check the Content Credentials in a JPEG.
 ///
 /// `Ok(None)` means the file simply has none.
-pub fn read_jpeg(jpeg: &[u8]) -> Result<Option<ValidationReport>> {
+pub fn validate_jpeg(jpeg: &[u8], options: &ValidationOptions) -> Result<Option<ValidationReport>> {
     let Some(embedded) = jpegxt::extract(jpeg).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
@@ -668,7 +875,7 @@ pub fn read_jpeg(jpeg: &[u8]) -> Result<Option<ValidationReport>> {
 
     let mut chain = Vec::new();
     for manifest in &manifests {
-        chain.push(inspect(manifest));
+        chain.push(inspect(manifest, options));
     }
 
     // The active manifest is the last one, and it is the only one whose hard
@@ -676,10 +883,7 @@ pub fn read_jpeg(jpeg: &[u8]) -> Result<Option<ValidationReport>> {
     // they came from, so re-checking their bindings here would be meaningless.
     let active_index = chain.len() - 1;
     let binding = check_hard_binding(jpeg, manifests[active_index], &embedded);
-    let active_status = &mut chain[active_index].status;
-    active_status.success.extend(binding.success);
-    active_status.informational.extend(binding.informational);
-    active_status.failure.extend(binding.failure);
+    chain[active_index].status.extend(binding);
 
     let active = chain[active_index].clone();
     Ok(Some(ValidationReport {
@@ -687,18 +891,21 @@ pub fn read_jpeg(jpeg: &[u8]) -> Result<Option<ValidationReport>> {
         chain,
         store: embedded.store,
         store_len: embedded.length,
+        validation_time: clock::to_rfc3339(options.validation_time),
     }))
 }
 
 /// Read one manifest and check everything internal to it: that each assertion
-/// hashes to what the claim says, and that the claim matches its signature.
-fn inspect(manifest: &Superbox) -> ManifestReport {
+/// hashes to what the claim says, that the claim matches its signature, and
+/// that the signer chains to a trust anchor.
+fn inspect(manifest: &Superbox, options: &ValidationOptions) -> ManifestReport {
     let mut status = StatusCodes::default();
     let mut report = ManifestReport {
         label: manifest.label.clone(),
         title: String::new(),
         instance_id: String::new(),
         generator: String::new(),
+        spec_version: String::new(),
         claim_version: 2,
         actions: Vec::new(),
         ingredients: Vec::new(),
@@ -706,14 +913,19 @@ fn inspect(manifest: &Superbox) -> ManifestReport {
         signature: SignatureReport::default(),
         thumbnail: None,
         status: StatusCodes::default(),
+        raw: RawManifest::default(),
     };
 
     let claim_box = manifest
         .child(LABEL_CLAIM)
-        .inspect(|_| report.claim_version = 2)
+        .inspect(|_| {
+            report.claim_version = 2;
+            report.raw.claim_label = LABEL_CLAIM.to_string();
+        })
         .or_else(|| {
             manifest.child(LABEL_CLAIM_V1).inspect(|_| {
                 report.claim_version = 1;
+                report.raw.claim_label = LABEL_CLAIM_V1.to_string();
             })
         });
 
@@ -756,6 +968,11 @@ fn inspect(manifest: &Superbox) -> ManifestReport {
         .unwrap_or_default()
         .to_string();
     report.generator = describe_generator(&claim);
+    report.spec_version = generator_info(&claim)
+        .and_then(|info| info.get("specVersion").and_then(Value::as_text))
+        .unwrap_or_default()
+        .to_string();
+    report.raw.claim = Some(claim.clone());
 
     let assertion_store = manifest.child(LABEL_ASSERTIONS);
     if let Some(assertions) = assertion_store {
@@ -763,6 +980,15 @@ fn inspect(manifest: &Superbox) -> ManifestReport {
         report.thumbnail = assertions
             .child(LABEL_THUMBNAIL)
             .and_then(|b| b.embedded_file().map(|(_, data)| data.to_vec()));
+        report.raw.assertions = assertions
+            .child_boxes()
+            .map(|box_| {
+                let decoded = box_
+                    .cbor_payload()
+                    .and_then(|bytes| super::cbor::decode(bytes).ok());
+                (box_.label.clone(), decoded)
+            })
+            .collect();
         read_actions(assertions, &mut report);
         read_ingredients(assertions, &mut report);
     } else {
@@ -773,7 +999,7 @@ fn inspect(manifest: &Superbox) -> ManifestReport {
     }
 
     check_assertion_hashes(&claim, assertion_store, &mut status);
-    check_signature(manifest, claim_bytes, &mut report, &mut status);
+    check_signature(manifest, claim_bytes, options, &mut report, &mut status);
 
     // A standard manifest must carry exactly one hard binding (section 11.2.1).
     if manifest.uuid == jumbf::UUID_MANIFEST
@@ -792,16 +1018,17 @@ fn inspect(manifest: &Superbox) -> ManifestReport {
     report
 }
 
-fn describe_generator(claim: &Value) -> String {
+fn generator_info(claim: &Value) -> Option<&Value> {
     // Claim v2 has a single generator-info-map; v1 had an array plus a
     // free-text `claim_generator` string.
-    let info = claim.get("claim_generator_info");
-    let map = match info {
+    match claim.get("claim_generator_info") {
         Some(Value::Array(items)) => items.first(),
         other => other,
-    };
+    }
+}
 
-    if let Some(map) = map {
+fn describe_generator(claim: &Value) -> String {
+    if let Some(map) = generator_info(claim) {
         let name = map.get("name").and_then(Value::as_text).unwrap_or_default();
         let version = map.get("version").and_then(Value::as_text);
         if !name.is_empty() {
@@ -885,6 +1112,11 @@ fn read_actions(assertions: &Superbox, report: &mut ManifestReport) {
                 .unwrap_or_default()
                 .to_string(),
             software_agent,
+            digital_source_type: item
+                .get("digitalSourceType")
+                .and_then(Value::as_text)
+                .unwrap_or_default()
+                .to_string(),
         });
     }
 }
@@ -978,9 +1210,13 @@ fn check_assertion_hashes(claim: &Value, assertions: Option<&Superbox>, status: 
     }
 }
 
+/// Check the claim signature: the algorithm, the signature itself, the
+/// time-stamp, the trust path and the validity window, in the order section
+/// 15.7 and 15.8 prescribe.
 fn check_signature(
     manifest: &Superbox,
     claim_bytes: &[u8],
+    options: &ValidationOptions,
     report: &mut ManifestReport,
     status: &mut StatusCodes,
 ) {
@@ -1006,12 +1242,25 @@ fn check_signature(
     };
 
     report.signature.algorithm = parsed.algorithm_name().to_string();
-    report.signature.time_stamped = false;
+    report.raw.chain = parsed.chain.clone();
+    report.raw.timestamp_token = parsed.timestamp_token.clone();
+
+    if !super::verify::is_allowed_cose_algorithm(parsed.algorithm) {
+        status.failure.push(Status::new(
+            "algorithm.unsupported",
+            format!(
+                "{} is not on the allowed signature algorithm list",
+                parsed.algorithm_name()
+            ),
+        ));
+        return;
+    }
 
     if let Some(certificate) = parsed.chain.first() {
         if let Ok(certificate) = x509::parse_certificate(certificate) {
             report.signature.subject = certificate.subject.clone();
             report.signature.subject_organisation = certificate.subject_organisation.clone();
+            report.signature.serial_number = certificate.serial.clone();
             report.signature.issuer = if certificate.issuer_common_name.is_empty() {
                 certificate.issuer.clone()
             } else {
@@ -1019,8 +1268,113 @@ fn check_signature(
             };
             report.signature.not_before = certificate.not_before.clone();
             report.signature.not_after = certificate.not_after.clone();
+            report.signature.assurance_level = certificate.c2pa_assurance_level;
+            report.signature.cpl_record_id =
+                certificate.c2pa_cpl_record_id.clone().unwrap_or_default();
         }
     }
+
+    // Section 15.8: the time-stamp is checked first, because a trusted one
+    // moves the instant the signing certificate's validity is judged at.
+    if parsed.timestamp_ambiguous {
+        status.informational.push(Status::new(
+            "timestamp.malformed",
+            "the signature carries more than one time-stamp token",
+        ));
+    }
+    let mut judged_at = options.validation_time;
+    if let Some(token) = &parsed.timestamp_token {
+        // sigTst carries a whole TimeStampResp; sigTst2 the bare token.
+        let token = if parsed.timestamp_is_v1 {
+            match timestamp::token_from_response(token) {
+                Ok(inner) => inner,
+                Err(why) => {
+                    status
+                        .informational
+                        .push(Status::new("timestamp.malformed", why));
+                    Vec::new()
+                }
+            }
+        } else {
+            token.clone()
+        };
+
+        if !token.is_empty() {
+            let verdict = timestamp::check(&token, &parsed.signature, &options.tsa_trust);
+            match &verdict {
+                Verdict::Trusted { at, authority } => {
+                    judged_at = *at;
+                    report.signature.time_stamped = true;
+                    report.signature.time_stamp = clock::to_rfc3339(*at);
+                    report.signature.time_stamp_authority = authority.clone();
+                    status
+                        .success
+                        .push(Status::new("timeStamp.trusted", verdict.explanation()));
+                    status
+                        .success
+                        .push(Status::new("timeStamp.validated", verdict.explanation()));
+                }
+                other => status
+                    .informational
+                    .push(Status::new(other.code(), other.explanation())),
+            }
+        }
+    }
+
+    // Section 15.7: the trust path, then the signature itself.
+    let outcome = trust::evaluate(
+        &options.trust,
+        &parsed.chain,
+        judged_at,
+        Purpose::ClaimSigning,
+    );
+    report.signature.trusted = outcome.trusted;
+    report.signature.trust_anchor = outcome.anchor.clone().unwrap_or_default();
+
+    if outcome.trusted {
+        status.success.push(Status::new(
+            "signingCredential.trusted",
+            outcome.reason.clone(),
+        ));
+        if outcome.inside_validity {
+            status.success.push(Status::new(
+                "claimSignature.insideValidity",
+                format!(
+                    "the signing certificate was valid at {}",
+                    clock::to_rfc3339(judged_at)
+                ),
+            ));
+        } else {
+            status.failure.push(Status::new(
+                "claimSignature.outsideValidity",
+                format!(
+                    "the signing certificate was not valid at {}",
+                    clock::to_rfc3339(judged_at)
+                ),
+            ));
+        }
+    } else if options.trust.is_empty() {
+        // No trust list is a different situation from a signer that failed
+        // against one, and reporting them the same way would either
+        // over-warn or under-warn depending on which was true.
+        status.informational.push(Status::new(
+            "signingCredential.untrusted",
+            "no trust list was supplied, so the signer's identity was not checked",
+        ));
+    } else {
+        status.failure.push(Status::new(
+            "signingCredential.untrusted",
+            outcome.reason.clone(),
+        ));
+    }
+
+    // Revocation. C2PA carries it as a stapled OCSP response captured at
+    // signing time; there is none here, and no live fetch is possible from a
+    // browser tab, so this is reported rather than assumed either way.
+    status.informational.push(Status::new(
+        "signingCredential.ocsp.skipped",
+        "no stapled revocation response was present",
+    ));
 
     match cose::verify(&parsed, claim_bytes) {
         Ok(()) => status.success.push(Status::new(
@@ -1031,14 +1385,6 @@ fn check_signature(
             .failure
             .push(Status::new("claimSignature.mismatch", e.to_string())),
     }
-
-    // Say plainly what has not been established. This validator has no trust
-    // anchor store, so it cannot tell a real signer from an impostor, and
-    // reporting the signature as simply "valid" would overstate the result.
-    status.informational.push(Status::new(
-        "signingCredential.untrusted",
-        "the signer was not checked against any trust list",
-    ));
 }
 
 /// Recompute the hard binding: hash the file with the manifest's own bytes

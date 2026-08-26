@@ -11,6 +11,10 @@ export default defineConfig({
     },
 
     build: {
+        // `npm run build` is invoked from the repository root, so the output
+        // goes where the deploy workflow expects it rather than beside the app.
+        outDir: '../../dist',
+        emptyOutDir: true,
         target: 'esnext',
         // A 2MB engine is expected; warning about it every build is noise.
         chunkSizeWarningLimit: 4096,

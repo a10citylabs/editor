@@ -2,7 +2,7 @@
 name = "imagecore"
 version = "0.1.0"
 edition = "2021"
-description = "WebAssembly image processing core for the A10city Image Editor"
+description = "WebAssembly image processing core and C2PA claim generator for the A10city Image Editor"
 license = "MIT"
 repository = "https://github.com/a10citylabs/editor"
 
@@ -40,34 +40,55 @@ imageproc = { version = "0.27", default-features = false }
 
 # --- Content Credentials (C2PA) ---------------------------------------------
 # The claim generator is written against the C2PA 2.2 specification directly
-# rather than pulling in `c2pa-rs`: that crate carries a full trust-list and
-# OCSP stack this proof of concept has no use for, and its wasm story goes
-# through a different toolchain than `wasm-bindgen`. What is left is small
-# enough to read - deterministic CBOR, JUMBF boxes and COSE_Sign1.
+# rather than pulling in `c2pa-rs`: that crate's wasm story goes through a
+# different toolchain than `wasm-bindgen`, and the Conformance Program holds
+# the applicant accountable for its own implementation either way. What is left
+# is small enough to read - deterministic CBOR, JUMBF boxes and COSE_Sign1.
 #
-# Note what is *not* here: no `getrandom` and no clock. Neither exists on
-# wasm32-unknown-unknown without a shim, so the host passes in the time and the
-# random bytes it already has from `crypto.getRandomValues`. That also makes
-# every test in this crate reproducible.
+# Note what is *not* here: no signing key and no private-key type at all. The
+# Edge subsystem never holds one; see `services/claim-signer`. Also no clock and
+# no `getrandom` - neither exists on wasm32-unknown-unknown without a shim, so
+# the host passes in the time and the random bytes it already has from
+# `crypto.getRandomValues`. That also makes every test in this crate
+# reproducible.
 sha2 = { version = "0.10", default-features = false }
-# `std` is deliberately off. It would switch on `rand_core/getrandom`, and
-# `getrandom` 0.2 does not build for wasm32-unknown-unknown without a JavaScript
-# shim. Nothing here needs an RNG - ECDSA signing is deterministic per RFC 6979,
-# and the UUIDs come from the host - so the honest fix is to drop the dependency
-# rather than to shim a random number generator this crate never calls.
-p256 = { version = "0.13", default-features = false, features = [
-    "ecdsa",
-    "pem",
-] }
+sha1 = { version = "0.10", default-features = false }
+
+# Signature verification only. `std` is deliberately off on the elliptic-curve
+# crates: it would switch on `rand_core/getrandom`, which does not build for
+# wasm32-unknown-unknown without a JavaScript shim, and nothing here needs an
+# RNG.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# Certification authorities on the C2PA Trust List issue from RSA roots as well
+# as elliptic-curve ones, so a validator that only understands ECDSA would
+# report perfectly good manifests as unverifiable.
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 console_error_panic_hook = { version = "0.1", optional = true }
 
 [features]
 default = ["panic-hook"]
 panic-hook = ["dep:console_error_panic_hook"]
+# Compiles in the test PKI under `conformance/test-credentials`, including its
+# private keys. Enabled by the test suite and by the conformance harness, and
+# by nothing that ships: `npm run build:wasm` does not set it, which is what
+# keeps a private key out of the browser bundle by construction rather than by
+# convention.
+test-pki = ["p256/pkcs8", "p256/pem"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Test fixtures sign with the test PKI under `conformance/test-credentials`.
+# This is the only place in the workspace outside the claim-signer service
+# where a private key type is linked at all, and it is a dev-dependency so it
+# cannot reach the shipped WebAssembly module.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "pkcs8"] }
+# A self-dependency so the integration tests can reach `c2pa::testpki`, which is
+# gated behind the `test-pki` feature. Unit tests get it from `cfg(test)`;
+# integration tests link the ordinary library, so they need the feature on.
+imagecore = { path = ".", features = ["test-pki"] }

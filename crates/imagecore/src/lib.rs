@@ -69,6 +69,20 @@ pub struct Editor {
     /// store is a few kilobytes and is all a new manifest needs to carry the
     /// provenance chain forward.
     credentials: Option<c2pa::ValidationReport>,
+    /// An export that has been built up to the point of needing a signature,
+    /// waiting for the Backend to answer. One slot: the interface only ever
+    /// has one save in flight, and a queue here would be a way to sign the
+    /// wrong image.
+    pending: Option<PendingSign>,
+}
+
+/// An export paused mid-flight while the claim-signer signs its claim.
+struct PendingSign {
+    prepared: c2pa::Prepared,
+    width: u32,
+    height: u32,
+    mime: String,
+    extension: String,
 }
 
 #[wasm_bindgen]
@@ -80,9 +94,17 @@ impl Editor {
     /// `hint` should be the original filename or MIME type. Content sniffing
     /// covers most formats; TGA has no leading magic number, so without the
     /// hint it cannot be identified at all.
+    /// `validation_json` carries what a validator needs and WebAssembly cannot
+    /// find for itself: the current time, and any trust lists the host wants
+    /// the signer checked against. See [`ValidationRequest`].
     #[wasm_bindgen(js_name = open)]
-    pub fn open(bytes: &[u8], hint: Option<String>) -> Result<Editor, JsError> {
+    pub fn open(
+        bytes: &[u8],
+        hint: Option<String>,
+        validation_json: Option<String>,
+    ) -> Result<Editor, JsError> {
         let decoded = codec::decode(bytes, hint.as_deref())?;
+        let options = ValidationRequest::parse(validation_json.as_deref())?;
 
         // Read any Content Credentials while the encoded bytes are still to
         // hand - the hard binding is over those bytes, so it cannot be checked
@@ -90,7 +112,7 @@ impl Editor {
         // reported as "none found" rather than failing the open: a broken
         // credential is no reason to refuse to edit someone's photo.
         let credentials = if c2pa::supports_format(&decoded.format) {
-            c2pa::read_jpeg(bytes).ok().flatten()
+            c2pa::validate_jpeg(bytes, &options).ok().flatten()
         } else {
             None
         };
@@ -100,6 +122,7 @@ impl Editor {
             source_format: decoded.format,
             had_alpha: decoded.had_alpha,
             credentials,
+            pending: None,
         })
     }
 
@@ -130,6 +153,7 @@ impl Editor {
             // Raw pixels arrive already decoded by the browser, so whatever
             // container they came from is gone and there is nothing to read.
             credentials: None,
+            pending: None,
         })
     }
 
@@ -219,16 +243,111 @@ impl Editor {
     /// Compose at full resolution and encode. `encode_json` accepts
     /// `{"format":"jpeg","quality":85,"pngCompression":"default","background":[255,255,255]}`.
     ///
-    /// `sign_json` requests Content Credentials. Empty means "do not sign";
-    /// otherwise it is a [`SignOptions`], and the caller supplies the clock and
-    /// the randomness because WebAssembly has neither.
+    /// This is the unsigned path. Writing Content Credentials takes two calls,
+    /// because the signature comes from the Backend subsystem over the network:
+    /// [`Editor::prepare_signed_export`] then [`Editor::complete_signed_export`].
     #[wasm_bindgen(js_name = renderExport)]
     pub fn render_export(
         &mut self,
         pipeline_json: &str,
         encode_json: &str,
-        sign_json: &str,
     ) -> Result<ExportResult, JsError> {
+        let (encoded, _, _) = self.encode(pipeline_json, encode_json)?;
+        Ok(encoded)
+    }
+
+    /// Build a manifest for the export and return the bytes that need signing.
+    ///
+    /// What comes back is a `Sig_structure`: a few hundred bytes holding the
+    /// claim, the certificate chain and a context string. The image is not in
+    /// it, and does not leave the tab. Hand those bytes to the claim-signer,
+    /// then pass its answer to [`Editor::complete_signed_export`].
+    #[wasm_bindgen(js_name = prepareSignedExport)]
+    pub fn prepare_signed_export(
+        &mut self,
+        pipeline_json: &str,
+        encode_json: &str,
+        sign_json: &str,
+        identity_json: &str,
+    ) -> Result<PendingExport, JsError> {
+        let identity = parse_identity(identity_json)?;
+        let options: SignOptions =
+            serde_json::from_str(sign_json).map_err(|e| Error::Credentials(e.to_string()))?;
+
+        let (encoded, pipeline, dims) = self.encode(pipeline_json, encode_json)?;
+
+        // Refusing rather than silently skipping. The caller only reaches this
+        // method when the user asked for a credential, and quietly handing back
+        // an unsigned file would be the one failure mode worth avoiding.
+        if !c2pa::supports_format(&encoded.extension) {
+            return Err(Error::Credentials(format!(
+                "Content Credentials can only be written to JPEG, not {}",
+                encoded.extension
+            ))
+            .into());
+        }
+
+        let prepared = self.build_manifest(&encoded.bytes, &pipeline, dims, &options, identity)?;
+        let to_be_signed = prepared.to_be_signed.clone();
+        let claim_len = prepared.claim.len() as u32;
+
+        self.pending = Some(PendingSign {
+            prepared,
+            width: encoded.width,
+            height: encoded.height,
+            mime: encoded.mime.clone(),
+            extension: encoded.extension.clone(),
+        });
+
+        Ok(PendingExport {
+            to_be_signed,
+            claim_len,
+        })
+    }
+
+    /// Finish the export begun by [`Editor::prepare_signed_export`].
+    ///
+    /// `timestamp` is the DER `TimeStampToken` the Backend obtained, or absent
+    /// if it could not reach a time-stamping authority. The file is written
+    /// either way; without one, the credential stops validating when the
+    /// signing certificate expires, and the interface says so.
+    #[wasm_bindgen(js_name = completeSignedExport)]
+    pub fn complete_signed_export(
+        &mut self,
+        signature: &[u8],
+        timestamp: Option<Vec<u8>>,
+    ) -> Result<ExportResult, JsError> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| Error::Credentials("no export is waiting for a signature".into()))?;
+
+        let signed = c2pa::manifest::complete(&pending.prepared, signature, timestamp.as_deref())
+            .map_err(Error::Credentials)?;
+
+        Ok(ExportResult {
+            width: pending.width,
+            height: pending.height,
+            mime: pending.mime,
+            extension: pending.extension,
+            bytes: signed.jpeg,
+            manifest_bytes: u32::try_from(signed.embedded_len).unwrap_or(u32::MAX),
+            time_stamped: signed.time_stamped,
+        })
+    }
+
+    /// Throw away a prepared export, for when signing was cancelled or failed.
+    #[wasm_bindgen(js_name = abandonSignedExport)]
+    pub fn abandon_signed_export(&mut self) {
+        self.pending = None;
+    }
+
+    /// Render and encode, shared by the signed and unsigned paths.
+    fn encode(
+        &mut self,
+        pipeline_json: &str,
+        encode_json: &str,
+    ) -> Result<(ExportResult, Pipeline, (u32, u32)), Error> {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let request: EncodeRequest = if encode_json.trim().is_empty() {
             EncodeRequest::default()
@@ -245,47 +364,32 @@ impl Editor {
             png_compression: request.png_compression,
             background: request.background,
         };
-        let mut bytes = codec::encode(&rendered.image, format, &opts)?;
+        let bytes = codec::encode(&rendered.image, format, &opts)?;
 
-        let mut manifest_bytes = 0u32;
-        if !sign_json.trim().is_empty() {
-            let options: SignOptions =
-                serde_json::from_str(sign_json).map_err(|e| Error::Credentials(e.to_string()))?;
-
-            // Refusing rather than silently skipping. The caller only sets this
-            // when the user asked for a credential, and quietly handing back an
-            // unsigned file would be the one failure mode worth avoiding.
-            if !c2pa::supports_format(&request.format) {
-                return Err(Error::Credentials(format!(
-                    "Content Credentials can only be written to JPEG, not {}",
-                    request.format
-                ))
-                .into());
-            }
-
-            let signed = self.sign(&bytes, &pipeline, (width, height), &options)?;
-            manifest_bytes = u32::try_from(signed.embedded_len).unwrap_or(u32::MAX);
-            bytes = signed.jpeg;
-        }
-
-        Ok(ExportResult {
-            width,
-            height,
-            mime: format.mime().to_string(),
-            extension: format.extension().to_string(),
-            bytes,
-            manifest_bytes,
-        })
+        Ok((
+            ExportResult {
+                width,
+                height,
+                mime: format.mime().to_string(),
+                extension: format.extension().to_string(),
+                bytes,
+                manifest_bytes: 0,
+                time_stamped: false,
+            },
+            pipeline,
+            (width, height),
+        ))
     }
 
-    /// Attach a manifest to freshly encoded JPEG bytes.
-    fn sign(
+    /// Build the manifest for freshly encoded JPEG bytes, up to the signature.
+    fn build_manifest(
         &mut self,
         jpeg: &[u8],
         pipeline: &Pipeline,
         output: (u32, u32),
         options: &SignOptions,
-    ) -> Result<c2pa::Signed, Error> {
+        identity: c2pa::SigningIdentity,
+    ) -> Result<c2pa::Prepared, Error> {
         // Something was opened in every case the editor supports - there is no
         // "File > New" here - so the first action is always c2pa.opened and
         // there is always a parentOf ingredient to point it at.
@@ -319,7 +423,7 @@ impl Editor {
             thumbnail,
         };
 
-        c2pa::sign_jpeg(jpeg, &request).map_err(Error::Credentials)
+        c2pa::manifest::prepare(jpeg, request, identity).map_err(Error::Credentials)
     }
 
     /// A small JPEG of the finished image for the `c2pa.thumbnail.claim`
@@ -479,6 +583,7 @@ pub struct ExportResult {
     extension: String,
     bytes: Vec<u8>,
     manifest_bytes: u32,
+    time_stamped: bool,
 }
 
 #[wasm_bindgen]
@@ -507,6 +612,12 @@ impl ExportResult {
     #[wasm_bindgen(getter, js_name = manifestBytes)]
     pub fn manifest_bytes(&self) -> u32 {
         self.manifest_bytes
+    }
+    /// Whether the credential carries an RFC 3161 time-stamp, which is what
+    /// keeps it validating after the signing certificate expires.
+    #[wasm_bindgen(getter, js_name = timeStamped)]
+    pub fn time_stamped(&self) -> bool {
+        self.time_stamped
     }
     /// Moves the encoded bytes out to JS, leaving this result empty.
     #[wasm_bindgen(js_name = takeBytes)]
@@ -569,35 +680,161 @@ pub fn capabilities() -> String {
     )
 }
 
-/// What this build can do with Content Credentials, and who it signs as.
+/// What this build can do with Content Credentials.
 ///
-/// The `untrusted` flag is not decoration. A browser claim generator publishes
-/// its signing key by existing, so the identity in every credential it writes
-/// is unverifiable, and the interface has to say so rather than showing a green
-/// tick. See `signing/README.md`.
+/// Note what is *not* here: a signer. The Edge subsystem holds no key and no
+/// certificate — it learns both from the claim-signer at run time — so
+/// capabilities can only report the shape of what it will do, never an
+/// identity. That is the visible consequence of the architecture the C2PA
+/// Conformance Program requires; see `crates/imagecore/src/c2pa/identity.rs`.
 fn content_credentials_json() -> String {
-    let Ok(signer) = c2pa::signer::describe() else {
-        return "{\"available\":false}".to_string();
-    };
-
-    let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
-    let usages: Vec<String> = signer
-        .extended_key_usage
-        .iter()
-        .map(|eku| format!("\"{}\"", escape(eku)))
-        .collect();
-
     format!(
-        "{{\"available\":true,\"formats\":[\"jpeg\"],\"signer\":{{\
-         \"name\":\"{}\",\"organisation\":\"{}\",\"issuer\":\"{}\",\
-         \"expires\":\"{}\",\"algorithm\":\"ES256\",\"keyUsage\":[{}],\
-         \"untrusted\":{},\"timeStamped\":false,\"source\":\"{}\"}}}}",
-        escape(&signer.common_name),
-        escape(&signer.organisation),
-        escape(&signer.issuer),
-        escape(&signer.not_after),
-        usages.join(","),
-        signer.anchor_is_self_signed,
-        signer.credential_source,
+        "{{\"available\":true,\"formats\":[\"jpeg\"],\"specVersion\":\"{}\",\
+         \"remoteSigning\":true,\"timeStamping\":true}}",
+        c2pa::SPEC_VERSION,
     )
+}
+
+/// Describe a signing identity the host fetched from the claim-signer.
+///
+/// The host passes back what `GET /v1/identity` returned; this parses the
+/// certificate chain, checks it is usable, and hands back what the interface
+/// should show — including the Assurance Level and Conforming Products List
+/// record the certificate carries, which are the two facts that distinguish a
+/// conformant Generator Product from anything else.
+#[wasm_bindgen(js_name = describeSigningIdentity)]
+pub fn describe_signing_identity(identity_json: &str) -> Result<String, JsError> {
+    let identity = parse_identity(identity_json)?;
+    let described = identity.describe().map_err(Error::Credentials)?;
+    serde_json::to_string(&described)
+        .map_err(|e| Error::Credentials(e.to_string()))
+        .map_err(Into::into)
+}
+
+/// Validate the Content Credentials in a JPEG without opening it for editing.
+///
+/// Returns the report as JSON, or `None` when the file carries none.
+#[wasm_bindgen(js_name = inspectJpeg)]
+pub fn inspect_jpeg(bytes: &[u8], validation_json: &str) -> Result<Option<String>, JsError> {
+    let options = ValidationRequest::parse(Some(validation_json))?;
+    let report = c2pa::validate_jpeg(bytes, &options).map_err(Error::Credentials)?;
+    Ok(report.map(|report| report.to_json()))
+}
+
+/// Validate a JPEG and return the result as crJSON.
+///
+/// This is the same validator the interface uses, serialised the way the C2PA
+/// Conformance Program asks for evidence. `crates/c2pa-harness` is the
+/// command-line front end over the identical code path, so what a reviewer sees
+/// is what a user sees.
+#[wasm_bindgen(js_name = validateToCrJson)]
+pub fn validate_to_crjson(bytes: &[u8], validation_json: &str) -> Result<String, JsError> {
+    let options = ValidationRequest::parse(Some(validation_json))?;
+    let report = c2pa::validate_jpeg(bytes, &options)
+        .map_err(Error::Credentials)?
+        .ok_or_else(|| Error::Credentials("the file carries no Content Credentials".into()))?;
+    Ok(c2pa::to_crjson(&report).to_string())
+}
+
+/// The signing identity as the claim-signer publishes it.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityRequest {
+    /// PEM certificate chain, end-entity first, trust anchor omitted.
+    chain_pem: String,
+    /// COSE algorithm name, e.g. `ES256`.
+    algorithm: String,
+    /// Which key version this chain belongs to.
+    #[serde(default)]
+    key_id: String,
+    /// Bytes to reserve for a time-stamp token. Zero means the Backend has no
+    /// time-stamping authority configured.
+    #[serde(default)]
+    timestamp_budget: usize,
+}
+
+fn parse_identity(json: &str) -> Result<c2pa::SigningIdentity, Error> {
+    let request: IdentityRequest =
+        serde_json::from_str(json).map_err(|e| Error::Credentials(e.to_string()))?;
+    let algorithm = c2pa::identity::alg::from_name(&request.algorithm).ok_or_else(|| {
+        Error::Credentials(format!(
+            "{} is not a signature algorithm this build understands",
+            request.algorithm
+        ))
+    })?;
+    c2pa::SigningIdentity::from_pem(
+        &request.chain_pem,
+        algorithm,
+        request.key_id,
+        request.timestamp_budget,
+    )
+    .map_err(Error::Credentials)
+}
+
+/// What a validator needs that WebAssembly cannot find for itself.
+///
+/// These are the Conformance Program's harness inputs, in the shape the browser
+/// passes them: a validation time and two trust lists. Every field is optional,
+/// and an absent trust list means "check the integrity, report the identity as
+/// unverified" rather than "trust everything".
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ValidationRequest {
+    /// RFC 3339. Required in practice - there is no clock here - but a missing
+    /// one falls back to the Unix epoch, which makes every certificate read as
+    /// not yet valid rather than silently valid.
+    #[serde(default)]
+    now: String,
+    #[serde(default)]
+    trust_list_pem: String,
+    #[serde(default)]
+    tsa_trust_list_pem: String,
+}
+
+impl ValidationRequest {
+    fn parse(json: Option<&str>) -> Result<c2pa::ValidationOptions, Error> {
+        let request: ValidationRequest = match json {
+            Some(json) if !json.trim().is_empty() => {
+                serde_json::from_str(json).map_err(|e| Error::Credentials(e.to_string()))?
+            }
+            _ => ValidationRequest::default(),
+        };
+
+        let load = |pem: &str| -> Result<c2pa::TrustStore, Error> {
+            if pem.trim().is_empty() {
+                return Ok(c2pa::TrustStore::empty());
+            }
+            c2pa::TrustStore::from_pem(pem)
+                .map(|(store, _)| store)
+                .map_err(Error::Credentials)
+        };
+
+        Ok(c2pa::ValidationOptions {
+            trust: load(&request.trust_list_pem)?,
+            tsa_trust: load(&request.tsa_trust_list_pem)?,
+            validation_time: c2pa::clock::parse_rfc3339(&request.now).unwrap_or(0),
+        })
+    }
+}
+
+/// An export waiting on the claim-signer.
+#[wasm_bindgen]
+pub struct PendingExport {
+    to_be_signed: Vec<u8>,
+    claim_len: u32,
+}
+
+#[wasm_bindgen]
+impl PendingExport {
+    /// The `Sig_structure` to send to the claim-signer. Moves the buffer out.
+    #[wasm_bindgen(js_name = takeToBeSigned)]
+    pub fn take_to_be_signed(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.to_be_signed)
+    }
+    /// Size of the claim inside it, for the interface to show what is being
+    /// sent.
+    #[wasm_bindgen(getter, js_name = claimBytes)]
+    pub fn claim_bytes(&self) -> u32 {
+        self.claim_len
+    }
 }

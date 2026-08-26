@@ -8,7 +8,7 @@ on:
 
 jobs:
   engine:
-    name: Image engine
+    name: Engine and services
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,13 +31,80 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -p imagecore --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -p imagecore
+        run: cargo test --workspace
 
       - name: Check the WebAssembly target builds
         run: cargo build -p imagecore --target wasm32-unknown-unknown --release
+
+  conformance:
+    name: C2PA conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Produces the crJSON evidence the Conformance Program asks applicants to
+      # submit, from assets this repository signs itself. When the Program
+      # supplies its own asset library, point `--asset-dir` at it instead.
+      - name: Generate crJSON evidence
+        run: ./conformance/scripts/generate-evidence.sh
+
+      - name: Upload the evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: crjson-evidence
+          path: conformance/evidence/crjson/
+          if-no-files-found: error
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: ${{ runner.os }}-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-audit-
+
+      # O.3 and O.4 at Assurance Level 1: an SBOM of everything in the Target
+      # of Evaluation, and a gate that refuses to release a CRITICAL or HIGH
+      # finding older than 90 days. `conformance/vulnerability-ledger.json` is
+      # what makes the clock survive a fresh runner.
+      - name: Software Bill of Materials
+        run: ./conformance/scripts/sbom.sh
+
+      - name: Vulnerability gate
+        run: ./conformance/scripts/vulnerability-scan.sh
+
+      - name: Upload the supply-chain evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-evidence
+          path: conformance/evidence/
+          if-no-files-found: warn
 
   web:
     name: Web app
@@ -69,5 +136,13 @@ jobs:
 
       - run: npm ci
       - run: npm run build:wasm
+
+      # The property that matters most in this repository, and the one a
+      # reviewer cannot check by reading: the module served to browsers must
+      # contain no private key. Runs here rather than in the `engine` job
+      # because it inspects the built artefact, which is what actually ships.
+      - name: Check the WebAssembly bundle carries no key material
+        run: ./conformance/scripts/check-no-key-material.sh
+
       - run: npm run typecheck
-      - run: npx vite build
+      - run: npx vite build apps/editor

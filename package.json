@@ -5,12 +5,14 @@
   "description": "A WebAssembly image editor - convert, resize, crop and rotate entirely in the browser. Rust engine, no uploads.",
   "type": "module",
   "scripts": {
-    "build:wasm": "wasm-pack build crates/imagecore --target web --out-dir ../../src/wasm --out-name imagecore --release",
-    "dev": "npm run build:wasm && vite",
-    "build": "npm run build:wasm && tsc && vite build",
-    "preview": "vite preview",
-    "test": "cargo test -p imagecore",
-    "typecheck": "tsc --noEmit"
+    "build:wasm": "wasm-pack build crates/imagecore --target web --out-dir ../../apps/editor/src/wasm --out-name imagecore --release",
+    "dev": "npm run build:wasm && vite apps/editor",
+    "build": "npm run build:wasm && npm run typecheck && vite build apps/editor",
+    "preview": "vite preview apps/editor",
+    "test": "cargo test --workspace",
+    "typecheck": "tsc --noEmit -p apps/editor/tsconfig.json",
+    "sbom": "./conformance/scripts/sbom.sh",
+    "audit:supply-chain": "./conformance/scripts/vulnerability-scan.sh"
   },
   "devDependencies": {
     "typescript": "~5.9.3",

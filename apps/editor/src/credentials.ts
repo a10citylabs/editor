@@ -8,21 +8,27 @@
  *
  * The hard part of both is saying something true. A C2PA manifest supports two
  * quite different claims — "these pixels have not changed since signing" and
- * "this named party signed them" — and this app can only ever substantiate the
- * first. Its signing key ships inside the page, so anyone can mint a manifest
- * in its name. A green tick next to a signer's name would therefore be a lie,
- * and the wording here works hard not to tell it: integrity and identity are
- * reported as two separate lines, and the identity line always says who has
- * vouched for the signer, which is nobody.
+ * "this named party signed them" — and they are reported as separate lines
+ * because they are separately true. Integrity comes from the hard binding.
+ * Identity comes from the signing certificate chaining to a trust anchor, and
+ * whether that check even ran depends on whether a trust list was configured.
  *
- * This matters more than it might seem. The failure mode C2PA is designed
- * against is someone believing a picture because an interface told them to.
+ * So there are three states, not two, and the wording distinguishes them:
+ *
+ *   - **trusted** — the chain reached an anchor on the supplied trust list
+ *   - **not checked** — no trust list was configured, so nobody looked
+ *   - **untrusted** — a list was supplied and the chain did not reach it
+ *
+ * Collapsing the middle one into either of the others is the failure mode C2PA
+ * exists to prevent: someone believing a picture because an interface told them
+ * to, or dismissing a good one because it said the wrong thing.
  */
 
 import type {
     CredentialManifest,
     CredentialReport,
     CredentialSupport,
+    SignerDescription,
     SourceInfo,
 } from './types';
 
@@ -103,6 +109,8 @@ export class CredentialsPanel {
     private readonly onSignChange: (enabled: boolean) => void;
 
     private support: CredentialSupport = { available: false };
+    private signer: SignerDescription | null = null;
+    private signerProblem: string | null = null;
     private report: CredentialReport | null = null;
     private thumbnail: string | null = null;
     private sourceFormat = '';
@@ -124,6 +132,18 @@ export class CredentialsPanel {
     /** What the engine reported it can do, from `capabilities()`. */
     setSupport(support: CredentialSupport): void {
         this.support = support;
+        this.render();
+    }
+
+    /**
+     * Who the claim-signer says it is, or why it could not be reached.
+     *
+     * Both nulls means no signer is configured, which is a supported
+     * deployment: the editor exports without a credential and says so.
+     */
+    setSigner(signer: SignerDescription | null, problem: string | null): void {
+        this.signer = signer;
+        this.signerProblem = problem;
         this.render();
     }
 
@@ -151,10 +171,18 @@ export class CredentialsPanel {
         return this.wanted && this.canSign;
     }
 
-    /** Whether signing is possible at all, given the build and the format. */
+    /**
+     * Whether signing is possible at all: the build supports it, the output
+     * format can carry a manifest, and a claim-signer answered.
+     *
+     * The last of those is the one that changed when the signing key left the
+     * browser. Without a Backend subsystem there is no key anywhere, so there
+     * is nothing to offer.
+     */
     private get canSign(): boolean {
         return (
             this.support.available === true &&
+            this.signer !== null &&
             (this.support.formats ?? []).includes(this.outputFormat)
         );
     }
@@ -251,21 +279,69 @@ export class CredentialsPanel {
         head.append(headText);
         wrap.append(head);
 
-        // Identity, stated separately from integrity and never as a tick. This
-        // is the claim the app cannot substantiate.
+        // Identity, stated separately from integrity and never as a bare tick.
+        // Three states, not two: trusted, not checked, and checked-and-failed.
         const signature = manifest.signature;
-        const signer = signature.subjectOrganisation || signature.subject || 'an unnamed signer';
+        const signer =
+            signature.subjectOrganisation || signature.subject || 'an unnamed signer';
+        wrap.append(field('Signed by', signer));
+
+        if (signature.trusted) {
+            wrap.append(field('Vouched for by', signature.trustAnchor, 'is-good'));
+        } else if (wasCheckedAgainstTrustList(manifest)) {
+            wrap.append(
+                field(
+                    'Vouched for by',
+                    `${signature.issuer || 'an unknown issuer'} — not on the trust list`,
+                    'is-bad',
+                ),
+            );
+        } else {
+            wrap.append(
+                field(
+                    'Vouched for by',
+                    `${signature.issuer || 'an unknown issuer'} — not checked against any trust list`,
+                    'is-caution',
+                ),
+            );
+        }
+
+        // The Assurance Level and the Conforming Products List record come
+        // straight out of the certificate. They are the two facts that separate
+        // a conformant Generator Product from anything that can emit CBOR, and
+        // showing them beats any wording this panel could invent.
+        if (signature.assuranceLevel !== null) {
+            wrap.append(
+                field(
+                    'Conformance',
+                    `C2PA Assurance Level ${signature.assuranceLevel}${
+                        signature.cplRecordId ? ` · CPL ${signature.cplRecordId}` : ''
+                    }`,
+                ),
+            );
+        }
+
         wrap.append(
-            field('Signed by', signer),
             field(
-                'Vouched for by',
-                signature.issuer
-                    ? `${signature.issuer} — not on any public trust list`
-                    : 'nobody',
-                'is-caution',
+                'Signature',
+                signature.timeStamped
+                    ? `${signature.algorithm}, time-stamped ${formatWhen(signature.timeStamp)}${
+                          signature.timeStampAuthority ? ` by ${signature.timeStampAuthority}` : ''
+                      }`
+                    : `${signature.algorithm}, no trusted time-stamp`,
+                signature.timeStamped ? '' : 'is-caution',
             ),
-            field('Signature', `${signature.algorithm}, no trusted time-stamp`),
         );
+        if (!signature.timeStamped && signature.notAfter) {
+            wrap.append(
+                line(
+                    `Without one, this credential stops validating when the signing certificate expires on ${formatWhen(
+                        signature.notAfter,
+                    )}.`,
+                    'cred-sub',
+                ),
+            );
+        }
 
         if (manifest.actions.length) {
             wrap.append(subheading('What was done'));
@@ -354,7 +430,28 @@ export class CredentialsPanel {
 
         if (!this.support.available) {
             signRow.hidden = true;
-            signNote.textContent = 'This build has no signing key, so it cannot write credentials.';
+            signNote.className = 'cred-note';
+            signNote.textContent = 'This build cannot write Content Credentials.';
+            return;
+        }
+
+        // No claim-signer is a supported deployment, not a fault: the signing
+        // key lives in the Backend subsystem, and the static build has none.
+        // Saying which of the two happened is the whole point of this branch.
+        if (!this.signer) {
+            signRow.hidden = true;
+            signNote.className = 'cred-note';
+            signNote.replaceChildren(
+                line(
+                    this.signerProblem
+                        ? `The signing service could not be reached: ${this.signerProblem}`
+                        : 'This deployment has no signing service, so exports carry no Content Credentials.',
+                ),
+                line(
+                    'The signing key is deliberately not in your browser — see conformance/README.md.',
+                    'cred-sub',
+                ),
+            );
             return;
         }
 
@@ -373,20 +470,25 @@ export class CredentialsPanel {
             return;
         }
 
-        const signer = this.support.signer;
         if (!this.wanted) {
             signNote.textContent = 'The exported JPEG will carry no record of where it came from.';
             signNote.className = 'cred-note';
             return;
         }
 
-        signNote.className = 'cred-note is-caution';
+        const signer = this.signer;
+        const conformant = signer.assuranceLevel !== null && signer.claimSigningEku;
+        signNote.className = conformant ? 'cred-note is-good' : 'cred-note is-caution';
         signNote.replaceChildren(
             line(
-                `Signed as ${signer?.name ?? 'this build'}, whose key is public — see signing/README.md.`,
+                `Signed as ${signer.organisation || signer.commonName}, by ${signer.issuer}.`,
             ),
             line(
-                'That proves the pixels are untouched, not who made them. Anyone can sign in this name.',
+                conformant
+                    ? `C2PA Assurance Level ${signer.assuranceLevel}${
+                          signer.timeStamped ? ', with a trusted time-stamp' : ', without a time-stamp'
+                      }. The claim is signed by the service; the image never leaves this tab.`
+                    : 'This certificate was not issued under the C2PA Certificate Policy, so validators will not recognise it as coming from a conforming Generator Product.',
                 'cred-sub',
             ),
         );
@@ -435,6 +537,21 @@ function check(kind: 'good' | 'bad' | 'info', code: string, explanation: string)
     text.textContent = explanation;
     item.append(name, text);
     return item;
+}
+
+/**
+ * Whether a trust list was consulted for this manifest.
+ *
+ * Derived from the status codes rather than from the app's own configuration,
+ * because the report is the record of what the validator actually did: the
+ * engine files `signingCredential.untrusted` as *informational* when no list
+ * was supplied and as a *failure* when one was and the chain missed it. Reading
+ * it back this way means the panel cannot drift out of step with the validator.
+ */
+function wasCheckedAgainstTrustList(manifest: CredentialManifest): boolean {
+    return !manifest.status.informational.some(
+        (entry) => entry.code === 'signingCredential.untrusted',
+    );
 }
 
 function isJpeg(format: string): boolean {

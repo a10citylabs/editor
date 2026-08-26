@@ -1,0 +1,22 @@
+[package]
+name = "c2pa-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Conformance test harness: validates C2PA assets and emits crJSON"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "c2pa-harness"
+path = "src/main.rs"
+
+[dependencies]
+# The harness is a front end over the product's own validator, not a second
+# implementation: whatever it reports, the browser reports. `test-pki` brings in
+# the test certificates so the end-to-end tests can produce assets to validate;
+# nothing in `main.rs` touches it.
+imagecore = { path = "../imagecore", default-features = false, features = ["test-pki"] }
+serde_json = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
