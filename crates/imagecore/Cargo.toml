@@ -38,6 +38,28 @@ fast_image_resize = { version = "6", features = ["image"] }
 # bindings - see README for the reasoning.
 imageproc = { version = "0.27", default-features = false }
 
+# --- Content Credentials (C2PA) ---------------------------------------------
+# The claim generator is written against the C2PA 2.2 specification directly
+# rather than pulling in `c2pa-rs`: that crate carries a full trust-list and
+# OCSP stack this proof of concept has no use for, and its wasm story goes
+# through a different toolchain than `wasm-bindgen`. What is left is small
+# enough to read - deterministic CBOR, JUMBF boxes and COSE_Sign1.
+#
+# Note what is *not* here: no `getrandom` and no clock. Neither exists on
+# wasm32-unknown-unknown without a shim, so the host passes in the time and the
+# random bytes it already has from `crypto.getRandomValues`. That also makes
+# every test in this crate reproducible.
+sha2 = { version = "0.10", default-features = false }
+# `std` is deliberately off. It would switch on `rand_core/getrandom`, and
+# `getrandom` 0.2 does not build for wasm32-unknown-unknown without a JavaScript
+# shim. Nothing here needs an RNG - ECDSA signing is deterministic per RFC 6979,
+# and the UUIDs come from the host - so the honest fix is to drop the dependency
+# rather than to shim a random number generator this crate never calls.
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",
+    "pem",
+] }
+
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

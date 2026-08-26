@@ -357,6 +357,38 @@
           </div>
         </details>
 
+        <details id="panel-credentials" class="panel panel-credentials">
+          <summary class="panel-head">
+            <span class="panel-title">Content Credentials</span>
+            <span class="panel-badge" id="cred-badge" hidden>verified</span>
+            <span class="panel-chev" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-body">
+            <div class="cred-state is-idle" id="cred-state" role="status" aria-live="polite">
+              <p>Open an image to check it for Content Credentials.</p>
+            </div>
+
+            <div class="cred-detail" id="cred-detail"></div>
+
+            <div class="cred-sign" id="cred-sign-row">
+              <label class="switch">
+                <input type="checkbox" id="cred-sign" checked>
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Sign the exported image</span>
+              </label>
+              <p class="cred-note" id="cred-sign-note"></p>
+            </div>
+
+            <p class="cred-spec">
+              Written to the C2PA 2.2 specification &mdash;
+              <a href="https://spec.c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html"
+                 target="_blank" rel="noopener noreferrer">the spec</a>,
+              <a href="https://contentcredentials.org/verify" target="_blank" rel="noopener noreferrer">
+                verify elsewhere</a>.
+            </p>
+          </div>
+        </details>
+
         <details id="panel-export" class="panel panel-export" open>
           <summary class="panel-head">
             <span class="panel-title">Export</span>

@@ -1015,3 +1015,294 @@ input[type="color"]::-moz-color-swatch {
         display: none !important;
     }
 }
+
+/* ============================================
+   Content Credentials (C2PA)
+
+   Two claims live in this panel and they must never blur together: whether
+   the pixels are intact, and who signed them. The first gets colour and a
+   badge; the second is always plain text naming who vouched for the signer,
+   because for a browser claim generator the answer is nobody. A green tick
+   beside a name is the one thing this panel must not draw.
+   ============================================ */
+
+.panel-credentials {
+    border-color: rgba(59, 130, 246, 0.22);
+}
+
+.panel-badge.is-bad {
+    background: var(--error);
+    color: var(--white);
+}
+
+.cred-state {
+    border-radius: 10px;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid transparent;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.cred-state p {
+    font-size: 0.78rem;
+    color: var(--gray-200);
+    line-height: 1.45;
+}
+
+.cred-state.is-idle {
+    background: rgba(255, 255, 255, 0.03);
+    border-color: rgba(255, 255, 255, 0.07);
+}
+
+.cred-state.is-good {
+    background: var(--success-bg);
+    border-color: rgba(34, 197, 94, 0.35);
+}
+
+.cred-state.is-bad {
+    background: var(--error-bg);
+    border-color: rgba(239, 68, 68, 0.4);
+}
+
+.cred-headline {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 600;
+    color: var(--white) !important;
+}
+
+.cred-sub {
+    color: var(--gray-500) !important;
+    font-size: 0.72rem !important;
+}
+
+.cred-detail:empty {
+    display: none;
+}
+
+.cred-manifest {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    padding-top: 0.7rem;
+    margin-top: 0.2rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.cred-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.cred-thumb {
+    width: 46px;
+    height: 46px;
+    object-fit: cover;
+    border-radius: 7px;
+    border: 1px solid rgba(164, 228, 57, 0.2);
+    flex-shrink: 0;
+}
+
+.cred-head-text {
+    min-width: 0;
+}
+
+.cred-title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--white);
+    overflow-wrap: anywhere;
+}
+
+.cred-subheading {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: var(--gray-500);
+    margin-top: 0.3rem;
+}
+
+.cred-field {
+    display: flex;
+    gap: 0.5rem;
+    font-size: 0.74rem;
+    line-height: 1.4;
+}
+
+.cred-key {
+    color: var(--gray-500);
+    flex-shrink: 0;
+    min-width: 6.5rem;
+}
+
+.cred-value {
+    color: var(--gray-200);
+    overflow-wrap: anywhere;
+}
+
+/* Reserved for the identity claim, which is never a pass. */
+.cred-field.is-caution .cred-value {
+    color: var(--warning);
+}
+
+.cred-actions,
+.cred-chain {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    list-style: none;
+    counter-reset: cred-step;
+}
+
+.cred-actions li,
+.cred-chain li {
+    display: flex;
+    flex-direction: column;
+    gap: 0.05rem;
+    padding: 0.3rem 0.5rem 0.3rem 1.4rem;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 7px;
+    border-left: 2px solid rgba(164, 228, 57, 0.4);
+    position: relative;
+}
+
+.cred-actions li::before {
+    counter-increment: cred-step;
+    content: counter(cred-step);
+    position: absolute;
+    left: 0.45rem;
+    top: 0.32rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    color: var(--gray-500);
+}
+
+.cred-chain li.is-good {
+    border-left-color: var(--success);
+}
+
+.cred-chain li.is-bad {
+    border-left-color: var(--error);
+}
+
+.cred-action-name {
+    font-size: 0.76rem;
+    font-weight: 500;
+    color: var(--white);
+}
+
+.cred-action-detail {
+    font-size: 0.7rem;
+    color: var(--gray-500);
+    overflow-wrap: anywhere;
+}
+
+.cred-checks {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    list-style: none;
+}
+
+.cred-checks li {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.4rem;
+    align-items: baseline;
+    font-size: 0.7rem;
+    color: var(--gray-500);
+    padding-left: 1rem;
+    position: relative;
+}
+
+.cred-checks li::before {
+    position: absolute;
+    left: 0;
+    font-weight: 700;
+}
+
+.cred-checks li.is-good::before {
+    content: "\2713";
+    color: var(--success);
+}
+
+.cred-checks li.is-bad::before {
+    content: "\2717";
+    color: var(--error);
+}
+
+.cred-checks li.is-info::before {
+    content: "\2139";
+    color: var(--info);
+}
+
+/* The status code itself, so a reader can look up exactly which guarantee
+   they are being given rather than trusting the English. */
+.cred-checks code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    color: var(--gray-200);
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 4px;
+    padding: 0.05rem 0.28rem;
+    white-space: nowrap;
+}
+
+.cred-sign {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.cred-sign.is-disabled .switch {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.cred-note,
+.cred-note p {
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--gray-500);
+}
+
+.cred-note.is-caution,
+.cred-note.is-caution p {
+    color: var(--warning);
+}
+
+.cred-note.is-caution .cred-sub {
+    color: var(--gray-500) !important;
+}
+
+.cred-spec {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    color: var(--gray-500);
+    line-height: 1.5;
+}
+
+.cred-spec a {
+    color: var(--lime-primary);
+    text-decoration: none;
+}
+
+.cred-spec a:hover,
+.cred-spec a:focus-visible {
+    text-decoration: underline;
+}
+
+/* A credential is small print, but not unreadably so. */
+@media (prefers-contrast: more) {
+    .cred-sub,
+    .cred-note,
+    .cred-checks li {
+        color: var(--gray-200) !important;
+    }
+}

@@ -53,8 +53,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The signing credentials for Content Credentials. When both secrets are
+      # set, `crates/imagecore/build.rs` compiles them into the engine instead
+      # of the demo key committed under `signing/`; when they are absent, as on
+      # a fork, the demo key is used and the build still works.
+      #
+      # To be clear about what this buys: a secret keeps a key out of public git
+      # history. It cannot make the key secret. This engine is served to
+      # browsers, so whichever key it carries is published along with it. See
+      # `signing/README.md` for why that is inherent to client-side signing and
+      # what a trustworthy setup would look like instead.
       - name: Build
         run: npm run build
+        env:
+          C2PA_SIGNING_CERT: ${{ secrets.C2PA_SIGNING_CERT }}
+          C2PA_SIGNING_KEY: ${{ secrets.C2PA_SIGNING_KEY }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

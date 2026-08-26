@@ -7,6 +7,7 @@
  */
 
 import { Engine } from './engine';
+import { CredentialsPanel } from './credentials';
 import { CropOverlay } from './crop';
 import type {
     Capabilities,
@@ -16,6 +17,7 @@ import type {
     Pipeline,
     PreviewResult,
     ResampleFilter,
+    SignSpec,
     SourceInfo,
 } from './types';
 
@@ -102,6 +104,14 @@ const ui = {
     flattenRow: el('flatten-row'),
     flattenReadout: el('flatten-readout'),
     flattenInput: el<HTMLInputElement>('flatten-input'),
+    credPanel: el<HTMLDetailsElement>('panel-credentials'),
+    credBadge: el('cred-badge'),
+    credState: el('cred-state'),
+    credDetail: el('cred-detail'),
+    credSignRow: el('cred-sign-row'),
+    credSign: el<HTMLInputElement>('cred-sign'),
+    credSignNote: el('cred-sign-note'),
+
     exportName: el<HTMLInputElement>('export-name'),
     exportBtn: el<HTMLButtonElement>('export-btn'),
     exportLabel: el('export-label'),
@@ -148,6 +158,9 @@ let encode: EncodeSpec = {
 };
 
 let sourceName = 'image';
+/** Filename of the open file, kept whole for the ingredient assertion. */
+let sourceFileName = 'image';
+let sourceMime = 'image/jpeg';
 let cropAspect: number | null = null;
 let comparing = false;
 let exporting = false;
@@ -179,6 +192,17 @@ const crop = new CropOverlay({
  * selection drawn over it - you cannot adjust a crop you have already been
  * cropped out of. Collapsing the panel shows the composed result.
  */
+const credentials = new CredentialsPanel({
+    panel: ui.credPanel,
+    badge: ui.credBadge,
+    state: ui.credState,
+    detail: ui.credDetail,
+    signRow: ui.credSignRow,
+    signToggle: ui.credSign,
+    signNote: ui.credSignNote,
+    onSignChange: () => syncExportControls(),
+});
+
 function cropMode(): boolean {
     return ui.panelCrop.open && Boolean(source);
 }
@@ -360,6 +384,10 @@ async function load(file: File): Promise<void> {
         ui.statusSource.textContent = `${info.width} x ${info.height}`;
         ui.exportBtn.disabled = false;
 
+        sourceFileName = file.name || 'image';
+        sourceMime = file.type || 'image/jpeg';
+        credentials.setSource(info);
+
         encode = {
             ...encode,
             format: defaultOutputFormat(info),
@@ -475,6 +503,7 @@ function syncExportControls(): void {
 
     ui.qualityRow.hidden = !format.lossy;
     ui.pngRow.hidden = format.id !== 'png';
+    credentials.setOutputFormat(format.id);
 
     // Only offer a matte when something could actually be transparent.
     const couldBeTransparent = Boolean(source?.hasAlpha) || pipeline.angle !== 0;
@@ -922,8 +951,8 @@ async function runExport(): Promise<void> {
     syncExportControls();
 
     try {
-        const payload = await engine.export(pipeline, encode);
         const stem = (ui.exportName.value.replace(/\.[^.]+$/, '') || sourceName).trim();
+        const payload = await engine.export(pipeline, encode, signSpec(stem));
         const filename = `${stem || 'image'}.${payload.extension}`;
 
         const blob = new Blob([payload.bytes], { type: payload.mime });
@@ -937,9 +966,12 @@ async function runExport(): Promise<void> {
         // Revoking immediately can race the download in some browsers.
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
 
+        const credential = payload.manifestBytes
+            ? ` · signed +${formatBytes(payload.manifestBytes)}`
+            : '';
         ui.exportNote.textContent = `${filename} · ${payload.width} x ${payload.height} · ${formatBytes(
             blob.size,
-        )} · ${payload.ms.toFixed(0)} ms`;
+        )} · ${payload.ms.toFixed(0)} ms${credential}`;
         ui.exportNote.classList.add('ok');
         clearError();
     } catch (error) {
@@ -951,6 +983,32 @@ async function runExport(): Promise<void> {
         ui.exportBtn.classList.remove('is-working');
         syncExportControls();
     }
+}
+
+/**
+ * Assemble what the engine needs to sign, or null to export unsigned.
+ *
+ * The clock and the identifiers come from here because WebAssembly has neither
+ * a clock nor a random number generator without a shim. `crypto.randomUUID`
+ * gives the v4 UUIDs that C2PA requires for the manifest URN (section 8.1) and
+ * for the output's instance ID.
+ */
+function signSpec(stem: string): SignSpec | null {
+    if (!credentials.signingEnabled) return null;
+
+    return {
+        title: `${stem || 'image'}.${currentFormat()?.id === 'png' ? 'png' : 'jpg'}`,
+        now: new Date().toISOString(),
+        instanceId: `xmp:iid:${crypto.randomUUID()}`,
+        manifestId: `urn:c2pa:${crypto.randomUUID().toUpperCase()}`,
+        sourceName: sourceFileName,
+        sourceMime: sourceMime || 'image/jpeg',
+        // The opened file's own instance ID when it had a credential, so the
+        // ingredient names the exact version that was edited rather than just
+        // a filename anyone could reuse.
+        sourceInstanceId: source?.credentials?.active.instanceId ?? '',
+        thumbnail: true,
+    };
 }
 
 function wireStage(): void {
@@ -1062,6 +1120,7 @@ async function boot(): Promise<void> {
         );
 
         buildFormatChips();
+        credentials.setSupport(capabilities.contentCredentials);
 
         ui.engineLine.innerHTML =
             `imagecore v${capabilities.version} · Rust → WebAssembly` +
