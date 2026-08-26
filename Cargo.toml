@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/imagecore"]
+members = [
+    # The Edge subsystem's engine: image processing plus the C2PA claim
+    # generator and validator. Compiled to WebAssembly and served to browsers,
+    # so it holds no key material of any kind.
+    "crates/imagecore",
+    # The conformance test harness. Native only; produces crJSON validation
+    # results for the assets the Conformance Program supplies.
+    "crates/c2pa-harness",
+    # The Backend subsystem: the only place a claim signing key ever exists.
+    "services/claim-signer",
+]
 
 [profile.release]
 opt-level = 3

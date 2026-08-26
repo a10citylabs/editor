@@ -7,11 +7,19 @@
  * rather than copies.
  */
 
-import init, { Editor, capabilities } from './wasm/imagecore.js';
+import init, {
+    Editor,
+    capabilities,
+    describeSigningIdentity,
+} from './wasm/imagecore.js';
+import { ClaimSigner, SignerUnavailable } from './signer';
 import type {
     Capabilities,
     CredentialReport,
+    SignerConfig,
+    SignerDescription,
     SourceInfo,
+    ValidationRequest,
     WorkerRequest,
     WorkerResponse,
 } from './types';
@@ -20,6 +28,16 @@ let ready: Promise<void> | null = null;
 let editor: Editor | null = null;
 /** Object URL for the open file's manifest thumbnail, revoked on replacement. */
 let credentialThumbnailUrl: string | null = null;
+/**
+ * The Backend subsystem, once configured.
+ *
+ * Held here rather than on the main thread because the whole signing round trip
+ * happens on this side: the engine produces the bytes to be signed, the network
+ * call goes out, and the finished file comes back. Passing the intermediate
+ * `Sig_structure` across the worker boundary and back would double the copies
+ * for no benefit.
+ */
+let signer: ClaimSigner | null = null;
 
 function ensureReady(): Promise<void> {
     if (!ready) {
@@ -35,13 +53,18 @@ function ensureReady(): Promise<void> {
  * would add megabytes of WebAssembly for formats the browser already handles,
  * so we let it hand us raw RGBA instead.
  */
-async function open(bytes: ArrayBuffer, name: string, type: string): Promise<SourceInfo> {
+async function open(
+    bytes: ArrayBuffer,
+    name: string,
+    type: string,
+    validation: ValidationRequest,
+): Promise<SourceInfo> {
     const view = new Uint8Array(bytes);
     const hint = name || type;
 
     try {
         editor?.free();
-        editor = Editor.open(view, hint);
+        editor = Editor.open(view, hint, JSON.stringify(validation));
         return {
             width: editor.sourceWidth,
             height: editor.sourceHeight,
@@ -141,6 +164,96 @@ function labelFromMime(type: string): string {
     return subtype ? subtype.replace(/^x-/, '').split('+')[0] : 'browser';
 }
 
+/**
+ * Point the worker at a claim-signer, and report who it says it is.
+ *
+ * A configuration that is absent, or a service that cannot be reached, is not
+ * an error here: the editor still works and still exports, just without a
+ * credential. The interface needs to know which of the two happened, so both
+ * come back rather than collapsing into a null.
+ */
+async function connectSigner(
+    config: SignerConfig | null,
+): Promise<{ identity: SignerDescription | null; problem: string | null }> {
+    signer = null;
+    if (!config) {
+        return { identity: null, problem: null };
+    }
+
+    try {
+        const client = await ClaimSigner.fromConfig(config);
+        const identity = client.signingIdentity;
+        if (!identity) {
+            return { identity: null, problem: 'the claim-signer did not answer' };
+        }
+        signer = client;
+        // Parse the chain in Rust rather than trusting the service's summary of
+        // itself: the certificate is the authority on the Assurance Level and
+        // the Conforming Products List record, and the Edge is about to commit
+        // to it in a manifest.
+        return {
+            identity: JSON.parse(
+                describeSigningIdentity(JSON.stringify(identity)),
+            ) as SignerDescription,
+            problem: null,
+        };
+    } catch (error) {
+        return { identity: null, problem: messageOf(error) };
+    }
+}
+
+/**
+ * Build the manifest, send the claim for signing, and finish the file.
+ *
+ * The three steps are separate calls into the engine because a network round
+ * trip sits between the second and the third. `abandonSignedExport` matters:
+ * without it a failed signature would leave the engine holding a half-built
+ * manifest that the next export would trip over.
+ */
+async function exportSigned(
+    active: Editor,
+    pipeline: unknown,
+    encode: unknown,
+    sign: unknown,
+): Promise<{ encoded: ReturnType<Editor['renderExport']>; timeStampError: string | null }> {
+    if (!signer?.signingIdentity) {
+        throw new Error(
+            'Content Credentials need a claim-signer, and none is configured for this deployment.',
+        );
+    }
+
+    const pending = active.prepareSignedExport(
+        JSON.stringify(pipeline),
+        JSON.stringify(encode),
+        JSON.stringify(sign),
+        JSON.stringify(signer.signingIdentity),
+    );
+
+    let toBeSigned: Uint8Array;
+    try {
+        toBeSigned = pending.takeToBeSigned();
+    } finally {
+        pending.free();
+    }
+
+    try {
+        const signed = await signer.sign(toBeSigned);
+        return {
+            encoded: active.completeSignedExport(
+                signed.signature,
+                signed.timestampToken ?? undefined,
+            ),
+            timeStampError: signed.timestampError,
+        };
+    } catch (error) {
+        active.abandonSignedExport();
+        if (error instanceof SignerUnavailable) {
+            throw new Error(`Could not sign: ${error.message}`);
+        }
+        throw error;
+    }
+}
+
 function requireEditor(): Editor {
     if (!editor) throw new Error('No image is open yet.');
     return editor;
@@ -167,8 +280,19 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             }
 
             case 'open': {
-                const source = await open(request.bytes, request.name, request.type);
+                const source = await open(
+                    request.bytes,
+                    request.name,
+                    request.type,
+                    request.validation,
+                );
                 reply({ id: request.id, ok: true, kind: 'open', source });
+                break;
+            }
+
+            case 'signer': {
+                const { identity, problem } = await connectSigner(request.config);
+                reply({ id: request.id, ok: true, kind: 'signer', identity, problem });
                 break;
             }
 
@@ -210,11 +334,16 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             case 'export': {
                 const active = requireEditor();
                 const started = performance.now();
-                const encoded = active.renderExport(
-                    JSON.stringify(request.pipeline),
-                    JSON.stringify(request.encode),
-                    request.sign ? JSON.stringify(request.sign) : '',
-                );
+                const { encoded, timeStampError } = request.sign
+                    ? await exportSigned(active, request.pipeline, request.encode, request.sign)
+                    : {
+                          encoded: active.renderExport(
+                              JSON.stringify(request.pipeline),
+                              JSON.stringify(request.encode),
+                          ),
+                          timeStampError: null,
+                      };
+
                 const bytes = encoded.takeBytes();
                 const result = {
                     bytes: bytes.buffer as ArrayBuffer,
@@ -224,6 +353,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
                     height: encoded.height,
                     ms: performance.now() - started,
                     manifestBytes: encoded.manifestBytes,
+                    timeStamped: encoded.timeStamped,
+                    timeStampError,
                 };
                 encoded.free();
 

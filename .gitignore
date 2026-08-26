@@ -3,4 +3,16 @@ dist
 target
 
 # wasm-pack output - rebuilt by `npm run build:wasm`
-/src/wasm/
+/apps/editor/src/wasm/
+
+# Conformance evidence - reproducible with one command, and CI uploads it as a
+# build artefact. See conformance/README.md.
+/conformance/evidence/
+
+# Stray cargo-cyclonedx output, when sbom.sh is interrupted before it
+# collects the documents into conformance/evidence/.
+*.cdx.json
+
+# Python bytecode from the conformance scripts.
+__pycache__/
+*.pyc

@@ -9,6 +9,7 @@
 import { Engine } from './engine';
 import { CredentialsPanel } from './credentials';
 import { CropOverlay } from './crop';
+import { loadSignerConfig } from './signer';
 import type {
     Capabilities,
     CropRect,
@@ -19,6 +20,7 @@ import type {
     ResampleFilter,
     SignSpec,
     SourceInfo,
+    ValidationRequest,
 } from './types';
 
 /* -------------------------------------------------------------------------
@@ -361,12 +363,54 @@ function onFrame(frame: PreviewResult): void {
    Loading
    ------------------------------------------------------------------------- */
 
+/**
+ * What the validator needs and WebAssembly cannot find for itself.
+ *
+ * The trust lists are loaded once at start-up from `trust-lists/` beside the
+ * app. When they are absent the validator still checks the hard binding and the
+ * signature; it reports the signer's identity as unchecked rather than
+ * pretending either way. The clock comes from here because there is none in
+ * `wasm32-unknown-unknown`.
+ */
+function validationRequest(): ValidationRequest {
+    return {
+        now: new Date().toISOString(),
+        trustListPem: trustList,
+        tsaTrustListPem: tsaTrustList,
+    };
+}
+
+/**
+ * The C2PA Trust List and TSA Trust List, when this deployment ships them.
+ *
+ * Fetched rather than bundled so that a list can be refreshed without
+ * rebuilding the WebAssembly module: the C2PA updates its trust list
+ * independently of anyone's release cycle.
+ */
+async function loadTrustLists(): Promise<void> {
+    const fetchText = async (url: string): Promise<string> => {
+        try {
+            const response = await fetch(url, { cache: 'no-store' });
+            return response.ok ? await response.text() : '';
+        } catch {
+            return '';
+        }
+    };
+    [trustList, tsaTrustList] = await Promise.all([
+        fetchText('trust-lists/c2pa-trust-list.pem'),
+        fetchText('trust-lists/c2pa-tsa-trust-list.pem'),
+    ]);
+}
+
+let trustList = '';
+let tsaTrustList = '';
+
 async function load(file: File): Promise<void> {
     clearError();
     setBusy(true);
 
     try {
-        const info = await engine.open(file);
+        const info = await engine.open(file, validationRequest());
         source = info;
         sourceName = file.name.replace(/\.[^.]+$/, '') || 'image';
 
@@ -952,7 +996,9 @@ async function runExport(): Promise<void> {
 
     try {
         const stem = (ui.exportName.value.replace(/\.[^.]+$/, '') || sourceName).trim();
-        const payload = await engine.export(pipeline, encode, signSpec(stem));
+        const spec = signSpec(stem);
+        if (spec) ui.exportNote.textContent = 'Encoding, then signing…';
+        const payload = await engine.export(pipeline, encode, spec);
         const filename = `${stem || 'image'}.${payload.extension}`;
 
         const blob = new Blob([payload.bytes], { type: payload.mime });
@@ -966,14 +1012,26 @@ async function runExport(): Promise<void> {
         // Revoking immediately can race the download in some browsers.
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
 
+        // Say whether the credential is time-stamped, because that is what
+        // decides whether it still validates in a year's time.
         const credential = payload.manifestBytes
-            ? ` · signed +${formatBytes(payload.manifestBytes)}`
+            ? ` · signed +${formatBytes(payload.manifestBytes)}${
+                  payload.timeStamped ? ' · time-stamped' : ' · no time-stamp'
+              }`
             : '';
         ui.exportNote.textContent = `${filename} · ${payload.width} x ${payload.height} · ${formatBytes(
             blob.size,
         )} · ${payload.ms.toFixed(0)} ms${credential}`;
         ui.exportNote.classList.add('ok');
         clearError();
+        // A missing time-stamp is not a failed export, but it does shorten how
+        // long the credential stays valid, so it is worth one line.
+        if (payload.manifestBytes && payload.timeStampError) {
+            showError(
+                `Saved, but without a time-stamp: ${payload.timeStampError}. The credential ` +
+                    'will stop validating when the signing certificate expires.',
+            );
+        }
     } catch (error) {
         ui.exportNote.textContent = '';
         showError(error instanceof Error ? error.message : String(error));
@@ -1121,6 +1179,14 @@ async function boot(): Promise<void> {
 
         buildFormatChips();
         credentials.setSupport(capabilities.contentCredentials);
+
+        // Both are optional and neither blocks the editor: without trust lists
+        // the validator reports identity as unchecked, and without a signer
+        // exports simply carry no credential.
+        await loadTrustLists();
+        const config = await loadSignerConfig();
+        const { identity, problem } = await engine.connectSigner(config);
+        credentials.setSigner(identity, problem);
 
         ui.engineLine.innerHTML =
             `imagecore v${capabilities.version} · Rust → WebAssembly` +

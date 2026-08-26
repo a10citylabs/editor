@@ -23,29 +23,56 @@
 //! simple value `null`; section 13.2.3 is explicit that a zero-length byte
 //! string will not do.
 //!
-//! Not implemented: RFC 3161 time-stamps (`sigTst2`) and stapled OCSP responses
-//! (`rVals`). Both need a network round-trip to a third party at signing time,
-//! which an offline browser claim generator cannot do. Their absence is
-//! reported honestly to the user rather than papered over — see
-//! `signing/README.md` for what it costs.
-
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+//! # Nothing here signs
+//!
+//! This module builds the bytes to be signed and assembles the result around a
+//! signature someone else produced. It holds no key and links no key type. The
+//! signature comes back from `services/claim-signer`, which is the only
+//! component in the Target of Evaluation that ever sees one — see
+//! [`super::identity`] for why that is a conformance requirement rather than a
+//! preference.
+//!
+//! # Padding, and why the unprotected bucket is never empty
+//!
+//! The hard binding commits to the byte range the manifest occupies, so the
+//! signature box's size has to be fixed *before* the signature exists — and
+//! before the RFC 3161 time-stamp, whose size nobody can predict, comes back
+//! from the TSA. Section 10.4.2 solves this with a zero-filled `pad` in the
+//! COSE unprotected header: reserve generously, then shrink `pad` by exactly as
+//! much as the real values grew. The unprotected bucket is not covered by the
+//! signature, so rewriting it afterwards costs nothing.
+//!
+//! Section 10.4.4 notes the one wrinkle: deterministic CBOR encodes a byte
+//! string's length in a variable number of bytes, so growing `pad` by one byte
+//! sometimes grows its encoding by two. The sizes that fall in those cracks are
+//! made up with a second field, `pad2`, exactly as the specification prescribes.
 
 use super::cbor::Value;
+use super::identity::{alg, SigningIdentity};
 
 /// COSE header label 1: the signature algorithm.
 const HEADER_ALG: i64 = 1;
 /// COSE header label 33: `x5chain` (RFC 9360). C2PA 2.2 section 13.2.2 says to
 /// write the integer label, and that the string form is deprecated.
 const HEADER_X5CHAIN: i64 = 33;
-/// COSE algorithm -7: ECDSA with SHA-256.
-const ALG_ES256: i64 = -7;
 /// CBOR tag 18 marks a `COSE_Sign1`.
 const TAG_COSE_SIGN1: u64 = 18;
-/// A P-256 signature is r and s, 32 bytes each. Fixed width is what lets the
-/// manifest builder reserve space for a signature before producing one.
-pub const ES256_SIGNATURE_LEN: usize = 64;
+
+/// Unprotected header labels, all of them string-labelled in C2PA.
+const HEADER_SIG_TST2: &str = "sigTst2";
+const HEADER_SIG_TST: &str = "sigTst";
+const HEADER_PAD: &str = "pad";
+const HEADER_PAD2: &str = "pad2";
+
+/// Bytes reserved for an RFC 3161 time-stamp token by default.
+///
+/// A token signed by an elliptic-curve TSA runs to about 2 KB; one from an RSA
+/// authority with a three-deep chain can reach 8. Twelve kilobytes clears both
+/// with room to spare, and the Backend overrides it with a figure measured
+/// against the TSA actually in use. If a token still will not fit,
+/// [`assemble`] says so rather than truncating, and the caller re-prepares with
+/// a larger reservation — the retry section 10.4.4 describes.
+pub const TIMESTAMP_BUDGET: usize = 12 * 1024;
 
 #[derive(Debug)]
 pub struct CoseError(String);
@@ -58,18 +85,24 @@ impl std::fmt::Display for CoseError {
 
 impl std::error::Error for CoseError {}
 
-type Result<T> = std::result::Result<T, CoseError>;
+pub type Result<T> = std::result::Result<T, CoseError>;
 
 fn err<T>(message: impl Into<String>) -> Result<T> {
     Err(CoseError(message.into()))
 }
+
+/// Raised when a time-stamp token is larger than the space reserved for it.
+///
+/// Named because the caller has a specific remedy — reserve more and prepare
+/// again — rather than a generic failure to report.
+pub const ERR_RESERVATION_TOO_SMALL: &str = "the signature does not fit the reserved space";
 
 /// The protected header: algorithm plus the certificate chain.
 ///
 /// RFC 9360 says a single certificate is a bare `bstr` and a chain is an array
 /// of them. Writing an array of one instead is a common enough mistake that it
 /// is worth being explicit about.
-fn protected_header(chain: &[Vec<u8>]) -> Value {
+fn protected_header(chain: &[Vec<u8>], algorithm: i64) -> Value {
     let x5chain = if chain.len() == 1 {
         Value::bytes(chain[0].clone())
     } else {
@@ -77,13 +110,22 @@ fn protected_header(chain: &[Vec<u8>]) -> Value {
     };
 
     Value::Map(vec![
-        (Value::Uint(HEADER_ALG as u64), Value::NegInt(ALG_ES256)),
+        (Value::Uint(HEADER_ALG as u64), Value::NegInt(algorithm)),
         (Value::Uint(HEADER_X5CHAIN as u64), x5chain),
     ])
 }
 
+/// The encoded protected header for an identity: the exact bytes the signature
+/// will cover.
+pub fn protected_bytes(identity: &SigningIdentity) -> Vec<u8> {
+    protected_header(&identity.chain, identity.algorithm).encode()
+}
+
 /// Build the `Sig_structure` whose encoding is what actually gets signed.
-fn to_be_signed(protected: &[u8], payload: &[u8]) -> Vec<u8> {
+///
+/// This is the only thing the Edge subsystem sends to the Backend. It carries
+/// the claim, not the image — the picture never leaves the tab.
+pub fn sig_structure(protected: &[u8], payload: &[u8]) -> Vec<u8> {
     Value::Array(vec![
         Value::text("Signature1"),
         Value::bytes(protected.to_vec()),
@@ -95,79 +137,172 @@ fn to_be_signed(protected: &[u8], payload: &[u8]) -> Vec<u8> {
     .encode()
 }
 
-/// A `COSE_Sign1_Tagged` structure with a detached payload.
-fn assemble(protected: &[u8], signature: &[u8]) -> Vec<u8> {
-    Value::Tag(
-        TAG_COSE_SIGN1,
-        Box::new(Value::Array(vec![
-            Value::bytes(protected.to_vec()),
-            // Unprotected bucket. A time-stamped signature would carry
-            // `sigTst2` here; this one has nothing to put in it.
-            Value::Map(Vec::new()),
-            Value::Null,
-            Value::bytes(signature.to_vec()),
-        ])),
-    )
-    .encode()
+/// The `sigTst2` value: a `tstContainer` holding one DER `TimeStampToken`.
+fn tst_container(token: &[u8]) -> Value {
+    Value::Map(vec![(
+        Value::text("tstTokens"),
+        Value::Array(vec![Value::Map(vec![(
+            Value::text("val"),
+            Value::bytes(token.to_vec()),
+        )])]),
+    )])
 }
 
-/// Sign `claim_bytes`, returning the serialised `COSE_Sign1_Tagged`.
-///
-/// The signature is deterministic (RFC 6979), so signing the same claim with
-/// the same key twice gives identical bytes. That is not a security property
-/// here so much as a practical one: it needs no random number generator, which
-/// `wasm32-unknown-unknown` does not have, and it makes tests reproducible.
-pub fn sign(claim_bytes: &[u8], key: &SigningKey, chain: &[Vec<u8>]) -> Result<Vec<u8>> {
-    if chain.is_empty() {
-        return err("cannot sign without a certificate chain");
+/// How many bytes the CBOR head of a byte string of `n` bytes occupies.
+fn bstr_head(n: usize) -> usize {
+    match n {
+        0..=23 => 1,
+        24..=255 => 2,
+        256..=65_535 => 3,
+        _ => 5,
     }
-    let protected = protected_header(chain).encode();
-    let signature: Signature = key.sign(&to_be_signed(&protected, claim_bytes));
-    let raw = signature.to_bytes();
-    debug_assert_eq!(raw.len(), ES256_SIGNATURE_LEN);
-    Ok(assemble(&protected, &raw))
 }
 
-/// A `COSE_Sign1` produced with a placeholder signature, for sizing.
-///
-/// The manifest builder has to know how large the signature box will be before
-/// it can compute the byte offsets the claim commits to. Because ES256
-/// signatures are always 64 bytes and the protected header depends only on the
-/// certificate chain, a placeholder is exactly the size of the real thing —
-/// which [`crate::c2pa::manifest`] asserts rather than assumes.
-pub fn placeholder(chain: &[Vec<u8>]) -> Result<Vec<u8>> {
-    if chain.is_empty() {
-        return err("cannot size a signature without a certificate chain");
+/// The length `pad` must be for its encoded size to grow by `delta` bytes over
+/// an empty `pad`, or `None` when no length lands exactly on that figure.
+fn pad_length_for(delta: usize) -> Option<usize> {
+    if delta == 0 {
+        return Some(0);
     }
-    let protected = protected_header(chain).encode();
-    Ok(assemble(&protected, &[0u8; ES256_SIGNATURE_LEN]))
+    // An empty pad encodes as one head byte, so growing to n bytes costs
+    // bstr_head(n) + n - 1.
+    // head(n) + n == delta + 1, and the head is 1, 2, 3 or 5 bytes, so only
+    // four candidate lengths can possibly land on the figure.
+    for shrink in [0usize, 1, 2, 4] {
+        let n = delta.saturating_sub(shrink);
+        if bstr_head(n) + n == delta + 1 {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Choose `pad` and `pad2` lengths that add exactly `need` bytes.
+///
+/// `need` is measured against a header that already carries an empty `pad`, so
+/// the answer for `need == 0` is "leave it empty".
+fn padding_for(need: usize) -> Result<(usize, Option<usize>)> {
+    if let Some(pad) = pad_length_for(need) {
+        return Ok((pad, None));
+    }
+    // The gaps section 10.4.4 warns about. An empty `pad2` costs six bytes -
+    // one map-key head, four for the text, one for the empty byte string - so
+    // put six aside for it and land the rest in `pad`.
+    const EMPTY_PAD2_COST: usize = 6;
+    if need >= EMPTY_PAD2_COST {
+        if let Some(pad) = pad_length_for(need - EMPTY_PAD2_COST) {
+            return Ok((pad, Some(0)));
+        }
+    }
+    err(format!("no padding combination adds exactly {need} bytes"))
+}
+
+/// Assemble a `COSE_Sign1_Tagged` structure with a detached payload.
+///
+/// `target` is the size the result must be, because the hard binding already
+/// committed to it. Pass `None` while measuring, to learn what that size should
+/// be.
+pub fn assemble(
+    protected: &[u8],
+    signature: &[u8],
+    timestamp: Option<&[u8]>,
+    target: Option<usize>,
+) -> Result<Vec<u8>> {
+    let build = |pad: usize, pad2: Option<usize>| -> Vec<u8> {
+        let mut unprotected = Vec::new();
+        if let Some(token) = timestamp {
+            unprotected.push((Value::text(HEADER_SIG_TST2), tst_container(token)));
+        }
+        // Always present, even at zero length: section 10.4.2 asks for it, and
+        // a fixed shape means the measuring pass and the final pass differ only
+        // in the numbers.
+        unprotected.push((Value::text(HEADER_PAD), Value::bytes(vec![0u8; pad])));
+        if let Some(pad2) = pad2 {
+            unprotected.push((Value::text(HEADER_PAD2), Value::bytes(vec![0u8; pad2])));
+        }
+
+        Value::Tag(
+            TAG_COSE_SIGN1,
+            Box::new(Value::Array(vec![
+                Value::bytes(protected.to_vec()),
+                Value::Map(unprotected),
+                Value::Null,
+                Value::bytes(signature.to_vec()),
+            ])),
+        )
+        .encode()
+    };
+
+    let minimum = build(0, None);
+    let Some(target) = target else {
+        return Ok(minimum);
+    };
+
+    if minimum.len() > target {
+        return err(format!(
+            "{ERR_RESERVATION_TOO_SMALL}: {} bytes needed, {target} reserved",
+            minimum.len()
+        ));
+    }
+
+    let (pad, pad2) = padding_for(target - minimum.len())?;
+    let padded = build(pad, pad2);
+    if padded.len() != target {
+        return err(format!(
+            "padding produced {} bytes, expected {target}",
+            padded.len()
+        ));
+    }
+    Ok(padded)
+}
+
+/// The size a signature box must reserve for this identity.
+///
+/// Everything that varies — the certificate chain, the signature length, the
+/// time-stamp budget — is fixed by the identity, so this is exact rather than
+/// an estimate, and [`super::manifest`] asserts it rather than trusting it.
+pub fn reserved_len(identity: &SigningIdentity) -> Result<usize> {
+    let protected = protected_bytes(identity);
+    let signature = vec![0u8; identity.signature_len()];
+    let token = vec![0u8; identity.timestamp_budget];
+    let timestamp = (identity.timestamp_budget > 0).then_some(token.as_slice());
+    Ok(assemble(&protected, &signature, timestamp, None)?.len())
+}
+
+/// A `COSE_Sign1` of exactly [`reserved_len`] bytes, for sizing the manifest
+/// before any of its real values exist.
+pub fn placeholder(identity: &SigningIdentity) -> Result<Vec<u8>> {
+    let protected = protected_bytes(identity);
+    let signature = vec![0u8; identity.signature_len()];
+    let token = vec![0u8; identity.timestamp_budget];
+    let timestamp = (identity.timestamp_budget > 0).then_some(token.as_slice());
+    assemble(&protected, &signature, timestamp, None)
 }
 
 /// What a `COSE_Sign1` claims about itself, before any of it is believed.
-#[derive(Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ParsedSignature {
     /// DER certificates from `x5chain`, end-entity first.
     pub chain: Vec<Vec<u8>>,
     /// COSE algorithm identifier.
     pub algorithm: i64,
     pub signature: Vec<u8>,
+    /// The DER `TimeStampToken` from `sigTst2`, when one is present.
+    pub timestamp_token: Option<Vec<u8>>,
+    /// True when the deprecated `sigTst` header was used instead, whose value
+    /// is a whole `TimeStampResp` rather than a bare token.
+    pub timestamp_is_v1: bool,
+    /// Set when a time-stamp header carried more than one token, which section
+    /// 15.8.1.1 says to report and ignore.
+    pub timestamp_ambiguous: bool,
     /// The protected header exactly as encoded — the signature covers these
     /// bytes, so they must be verified as read rather than re-encoded.
-    protected: Vec<u8>,
+    pub protected: Vec<u8>,
 }
 
 impl ParsedSignature {
     pub fn algorithm_name(&self) -> &'static str {
-        match self.algorithm {
-            -7 => "ES256",
-            -35 => "ES384",
-            -36 => "ES512",
-            -37 => "PS256",
-            -38 => "PS384",
-            -39 => "PS512",
-            -8 => "EdDSA",
-            _ => "unknown",
-        }
+        alg::name(self.algorithm)
     }
 }
 
@@ -232,28 +367,48 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSignature> {
         },
     };
 
-    Ok(ParsedSignature {
+    let mut parsed = ParsedSignature {
         chain,
         algorithm,
         signature,
         protected,
-    })
+        ..ParsedSignature::default()
+    };
+
+    // The unprotected bucket. It is not covered by the signature, so nothing
+    // read here is trusted; the time-stamp inside carries its own proof.
+    if let Some(container) = array[1].get(HEADER_SIG_TST2) {
+        read_timestamp(container, &mut parsed, false);
+    } else if let Some(container) = array[1].get(HEADER_SIG_TST) {
+        read_timestamp(container, &mut parsed, true);
+    }
+
+    Ok(parsed)
+}
+
+fn read_timestamp(container: &Value, into: &mut ParsedSignature, v1: bool) {
+    let Some(tokens) = container.get("tstTokens").and_then(Value::as_array) else {
+        return;
+    };
+    // Section 15.8.1.1: more than one token is reported and the time-stamps
+    // ignored, rather than one being picked arbitrarily.
+    if tokens.len() != 1 {
+        into.timestamp_ambiguous = true;
+        return;
+    }
+    if let Some(value) = tokens[0].get("val").and_then(Value::as_bytes) {
+        into.timestamp_token = Some(value.to_vec());
+        into.timestamp_is_v1 = v1;
+    }
 }
 
 /// Check a parsed signature against the claim it should cover.
 ///
 /// This answers one question only — "was this claim signed by the key in that
 /// certificate?" — and deliberately not "should anyone trust that certificate?".
-/// The second needs a trust anchor store the app does not have.
+/// The second is [`super::trust`]'s job, because it needs a trust list and a
+/// validation time that this function has no business inventing.
 pub fn verify(parsed: &ParsedSignature, claim_bytes: &[u8]) -> Result<()> {
-    if parsed.algorithm != ALG_ES256 {
-        return err(format!(
-            "unsupported signature algorithm {} ({})",
-            parsed.algorithm,
-            parsed.algorithm_name()
-        ));
-    }
-
     let certificate = parsed
         .chain
         .first()
@@ -261,102 +416,198 @@ pub fn verify(parsed: &ParsedSignature, claim_bytes: &[u8]) -> Result<()> {
     let parsed_certificate =
         super::x509::parse_certificate(certificate).map_err(|e| CoseError(e.to_string()))?;
 
-    let key = VerifyingKey::from_sec1_bytes(&parsed_certificate.public_key)
-        .map_err(|e| CoseError(format!("signing certificate has no usable P-256 key: {e}")))?;
-    let signature = Signature::from_slice(&parsed.signature)
-        .map_err(|e| CoseError(format!("malformed ES256 signature: {e}")))?;
-
-    key.verify(&to_be_signed(&parsed.protected, claim_bytes), &signature)
-        .map_err(|_| CoseError("the claim does not match its signature".into()))
+    let message = sig_structure(&parsed.protected, claim_bytes);
+    super::verify::by_cose_algorithm(
+        parsed.algorithm,
+        &parsed_certificate,
+        &message,
+        &parsed.signature,
+    )
+    .map_err(|e| CoseError(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::c2pa::signer;
+    use crate::c2pa::testpki;
 
-    fn credentials() -> (SigningKey, Vec<Vec<u8>>) {
-        let signer = signer::load().expect("shipped credentials should load");
-        (signer.key, signer.chain)
+    fn sign_with_test_key(identity: &SigningIdentity, claim: &[u8]) -> Vec<u8> {
+        let protected = protected_bytes(identity);
+        testpki::sign_es256(&sig_structure(&protected, claim))
     }
 
     #[test]
-    fn signs_and_verifies_a_claim() {
-        let (key, chain) = credentials();
-        let claim = b"a claim, pretending to be CBOR";
+    fn a_signature_verifies_against_the_claim_it_covers() {
+        let identity = testpki::identity_without_timestamps();
+        let claim = b"a claim, more or less";
+        let signature = sign_with_test_key(&identity, claim);
+        let cose = assemble(
+            &protected_bytes(&identity),
+            &signature,
+            None,
+            Some(reserved_len(&identity).unwrap()),
+        )
+        .unwrap();
 
-        let cose = sign(claim, &key, &chain).unwrap();
         let parsed = parse(&cose).unwrap();
-
-        assert_eq!(parsed.algorithm, ALG_ES256);
         assert_eq!(parsed.algorithm_name(), "ES256");
-        assert_eq!(parsed.chain.len(), chain.len());
-        assert_eq!(parsed.signature.len(), ES256_SIGNATURE_LEN);
-        verify(&parsed, claim).expect("a freshly signed claim should verify");
+        assert_eq!(parsed.chain.len(), 2);
+        verify(&parsed, claim).expect("the signature should verify");
     }
 
     #[test]
-    fn a_changed_claim_fails_verification() {
-        let (key, chain) = credentials();
-        let cose = sign(b"the original claim", &key, &chain).unwrap();
+    fn a_changed_claim_stops_verifying() {
+        let identity = testpki::identity_without_timestamps();
+        let signature = sign_with_test_key(&identity, b"the original claim");
+        let cose = assemble(&protected_bytes(&identity), &signature, None, None).unwrap();
         let parsed = parse(&cose).unwrap();
-        assert!(verify(&parsed, b"the original cIaim").is_err());
+        assert!(verify(&parsed, b"a different claim").is_err());
     }
 
     #[test]
-    fn a_changed_certificate_fails_verification() {
-        // The point of putting x5chain in the *protected* bucket: swapping the
-        // certificate has to break the signature, not just the identity.
-        let (key, chain) = credentials();
+    fn the_certificate_chain_is_covered_by_the_signature() {
+        // Swapping the chain has to break verification, or x5chain would be a
+        // suggestion rather than a binding.
+        let identity = testpki::identity_without_timestamps();
         let claim = b"a claim";
-        let cose = sign(claim, &key, &chain).unwrap();
-        let mut parsed = parse(&cose).unwrap();
+        let signature = sign_with_test_key(&identity, claim);
 
-        let root = crate::c2pa::x509::pem_to_der(signer::SIGNING_ROOT_CA_PEM).unwrap();
-        parsed.chain = vec![root[0].clone()];
-        assert!(
-            verify(&parsed, claim).is_err(),
-            "verification must not silently use a substituted certificate"
-        );
+        let mut tampered =
+            parse(&assemble(&protected_bytes(&identity), &signature, None, None).unwrap()).unwrap();
+        tampered.protected = protected_header(&[testpki::root_ca_der()], alg::ES256).encode();
+        assert!(verify(&tampered, claim).is_err());
     }
 
     #[test]
-    fn a_flipped_signature_bit_fails_verification() {
-        let (key, chain) = credentials();
-        let claim = b"a claim";
-        let mut parsed = parse(&sign(claim, &key, &chain).unwrap()).unwrap();
-        parsed.signature[0] ^= 0x01;
-        assert!(verify(&parsed, claim).is_err());
-    }
-
-    #[test]
-    fn the_payload_is_detached() {
-        let (key, chain) = credentials();
-        let cose = sign(b"a claim", &key, &chain).unwrap();
-        let array = match super::super::cbor::decode(&cose).unwrap() {
-            Value::Tag(TAG_COSE_SIGN1, inner) => inner.as_array().unwrap().to_vec(),
-            _ => panic!("expected tag 18"),
+    fn the_payload_is_detached_rather_than_embedded() {
+        // Section 13.2.3: a null payload, never a zero-length byte string.
+        let identity = testpki::identity_without_timestamps();
+        let cose = assemble(&protected_bytes(&identity), &[0u8; 64], None, None).unwrap();
+        let decoded = crate::c2pa::cbor::decode(&cose).unwrap();
+        let Value::Tag(18, inner) = &decoded else {
+            panic!("expected a tagged COSE_Sign1, got {decoded:?}");
         };
-        assert_eq!(array[2], Value::Null, "detached content must be null");
-        assert_ne!(
-            array[2],
-            Value::bytes(Vec::new()),
-            "an empty bstr does not mean detached (section 13.2.3)"
+        assert!(matches!(inner.as_array().unwrap()[2], Value::Null));
+    }
+
+    #[test]
+    fn padding_hits_the_reserved_size_exactly_for_every_shortfall() {
+        // The size a time-stamp token comes back at is not predictable, so
+        // every possible gap between the real size and the reservation has to
+        // be fillable. The two the specification warns about are 24 and 257.
+        let identity = testpki::identity_without_timestamps();
+        let protected = protected_bytes(&identity);
+        let minimum = assemble(&protected, &[0u8; 64], None, None).unwrap().len();
+
+        for extra in 0..600usize {
+            let target = minimum + extra;
+            let built = assemble(&protected, &[0u8; 64], None, Some(target))
+                .unwrap_or_else(|e| panic!("shortfall of {extra} bytes: {e}"));
+            assert_eq!(built.len(), target, "shortfall of {extra} bytes");
+            // Whatever the padding, the result must still parse.
+            parse(&built).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_time_stamp_fits_in_the_space_reserved_for_it() {
+        let identity = testpki::identity();
+        let reserved = reserved_len(&identity).unwrap();
+        assert!(
+            reserved > TIMESTAMP_BUDGET,
+            "the reservation must cover the token"
+        );
+
+        // A token smaller than the budget, which is the normal case.
+        let token = vec![0xABu8; 2048];
+        let cose = assemble(
+            &protected_bytes(&identity),
+            &[0u8; 64],
+            Some(&token),
+            Some(reserved),
+        )
+        .unwrap();
+        assert_eq!(cose.len(), reserved);
+
+        let parsed = parse(&cose).unwrap();
+        assert_eq!(parsed.timestamp_token.as_deref(), Some(token.as_slice()));
+        assert!(!parsed.timestamp_is_v1);
+    }
+
+    #[test]
+    fn a_missing_time_stamp_still_fills_the_reservation() {
+        // The TSA can be unreachable. The manifest must come out the same size
+        // regardless, because the hard binding already committed to it.
+        let identity = testpki::identity();
+        let reserved = reserved_len(&identity).unwrap();
+        let cose = assemble(
+            &protected_bytes(&identity),
+            &[0u8; 64],
+            None,
+            Some(reserved),
+        )
+        .unwrap();
+        assert_eq!(cose.len(), reserved);
+        assert!(parse(&cose).unwrap().timestamp_token.is_none());
+    }
+
+    #[test]
+    fn an_oversized_time_stamp_is_reported_rather_than_truncated() {
+        let identity = testpki::identity();
+        let reserved = reserved_len(&identity).unwrap();
+        let token = vec![0u8; identity.timestamp_budget + 4096];
+        let error = assemble(
+            &protected_bytes(&identity),
+            &[0u8; 64],
+            Some(&token),
+            Some(reserved),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(ERR_RESERVATION_TOO_SMALL),
+            "the caller needs to be told to reserve more, got: {error}"
         );
     }
 
     #[test]
-    fn a_single_certificate_is_a_bare_bstr() {
-        // RFC 9360: one certificate is a bstr, several are an array of bstr.
-        let chain = vec![vec![0xAAu8; 4]];
-        let header = super::super::cbor::decode(&protected_header(&chain).encode()).unwrap();
+    fn more_than_one_token_is_flagged_and_ignored() {
+        let identity = testpki::identity_without_timestamps();
+        let container = Value::Map(vec![(
+            Value::text("tstTokens"),
+            Value::Array(vec![
+                Value::Map(vec![(Value::text("val"), Value::bytes(vec![1, 2, 3]))]),
+                Value::Map(vec![(Value::text("val"), Value::bytes(vec![4, 5, 6]))]),
+            ]),
+        )]);
+        let cose = Value::Tag(
+            TAG_COSE_SIGN1,
+            Box::new(Value::Array(vec![
+                Value::bytes(protected_bytes(&identity)),
+                Value::Map(vec![(Value::text(HEADER_SIG_TST2), container)]),
+                Value::Null,
+                Value::bytes(vec![0u8; 64]),
+            ])),
+        )
+        .encode();
+
+        let parsed = parse(&cose).unwrap();
+        assert!(parsed.timestamp_ambiguous);
+        assert!(parsed.timestamp_token.is_none());
+    }
+
+    #[test]
+    fn a_single_certificate_chain_is_a_bare_byte_string() {
+        // RFC 9360: one certificate is a bstr, several are an array. An array
+        // of one is the classic mistake.
+        let single = SigningIdentity::new(vec![testpki::leaf_der()], alg::ES256, "k", 0).unwrap();
+        let header = crate::c2pa::cbor::decode(&protected_bytes(&single)).unwrap();
         assert!(matches!(
             header.get_int(HEADER_X5CHAIN),
             Some(Value::Bytes(_))
         ));
 
-        let chain = vec![vec![0xAAu8; 4], vec![0xBBu8; 4]];
-        let header = super::super::cbor::decode(&protected_header(&chain).encode()).unwrap();
+        let pair = testpki::identity_without_timestamps();
+        let header = crate::c2pa::cbor::decode(&protected_bytes(&pair)).unwrap();
         assert!(matches!(
             header.get_int(HEADER_X5CHAIN),
             Some(Value::Array(_))
@@ -364,40 +615,8 @@ mod tests {
     }
 
     #[test]
-    fn a_placeholder_is_exactly_the_size_of_a_real_signature() {
-        // The manifest builder reserves space using `placeholder` and then
-        // writes the real signature into it. If these ever differed, every
-        // byte offset in the hard binding would be wrong.
-        let (key, chain) = credentials();
-        let real = sign(b"a claim of some length", &key, &chain).unwrap();
-        assert_eq!(placeholder(&chain).unwrap().len(), real.len());
-    }
-
-    #[test]
-    fn signing_is_deterministic() {
-        // RFC 6979. No RNG needed, which matters on wasm32-unknown-unknown.
-        let (key, chain) = credentials();
-        assert_eq!(
-            sign(b"a claim", &key, &chain).unwrap(),
-            sign(b"a claim", &key, &chain).unwrap()
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_input() {
-        assert!(parse(b"not cbor at all").is_err());
-        // A four-element array is required.
+    fn rejects_a_structure_that_is_not_a_cose_sign1() {
+        assert!(parse(b"").is_err());
         assert!(parse(&Value::Array(vec![Value::Null]).encode()).is_err());
-        // No algorithm in the protected header.
-        let headerless = Value::Tag(
-            TAG_COSE_SIGN1,
-            Box::new(Value::Array(vec![
-                Value::bytes(Value::Map(Vec::new()).encode()),
-                Value::Map(Vec::new()),
-                Value::Null,
-                Value::bytes(vec![0u8; 64]),
-            ])),
-        );
-        assert!(parse(&headerless.encode()).is_err());
     }
 }

@@ -1,0 +1,55 @@
+[package]
+name = "claim-signer"
+version = "0.1.0"
+edition = "2021"
+description = "The Backend subsystem of the A10city Image Editor Generator Product: the only place a C2PA claim signing key exists"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "claim-signer"
+path = "src/main.rs"
+
+[dependencies]
+# Shared with the Edge subsystem so the two cannot disagree about DER, the
+# certificate profile, or what a time-stamp token looks like.
+imagecore = { path = "../../crates/imagecore", default-features = false }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "1"
+
+# The RFC 3161 client. rustls only: the C2PA Conformance Program's O.5 asks for
+# TLS 1.3 on every hop between subsystems, and a native-TLS build would put that
+# in the hands of whatever the host OS happens to ship.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Key protection. AES-256-GCM for the key at rest, HMAC-SHA256 for request
+# authentication, and zeroize so the plaintext key does not outlive the signing
+# operation that needed it.
+aes-gcm = { version = "0.10", features = ["aes"] }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rand = "0.8"
+
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+
+[dev-dependencies]
+imagecore = { path = "../../crates/imagecore", default-features = false, features = ["test-pki"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

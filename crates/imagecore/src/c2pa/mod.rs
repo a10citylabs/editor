@@ -1,19 +1,36 @@
-//! Content Credentials: a browser-side C2PA claim generator.
+//! Content Credentials: the Edge half of a C2PA claim generator.
 //!
-//! This writes and reads C2PA 2.2 manifests for JPEG files, entirely inside the
-//! tab. Nothing is uploaded, and no reference implementation is linked in — the
-//! JUMBF containers, deterministic CBOR, COSE signatures and JPEG embedding are
-//! all built from the specification. The submodules are, in dependency order:
+//! This writes and reads C2PA 2.2 manifests for JPEG files. The image never
+//! leaves the tab; the *claim* is signed by `services/claim-signer`, which
+//! receives a 90-byte digest structure and returns a signature. No reference
+//! implementation is linked in — the JUMBF containers, deterministic CBOR, COSE
+//! signatures, RFC 3161 time-stamp handling, certificate path validation and
+//! JPEG embedding are all built from the specification. The submodules are, in
+//! dependency order:
 //!
 //! | Module | Specification |
 //! |---|---|
 //! | [`cbor`] | RFC 8949, incl. the deterministic encoding of clause 4.2.1 |
+//! | [`clock`] | RFC 3339 and ASN.1 times, reduced to comparable instants |
+//! | [`der`] | Enough DER to write an RFC 3161 request |
 //! | [`jumbf`] | ISO/IEC 19566-5 boxes; C2PA §11.1 labels and UUIDs |
 //! | [`jpegxt`] | C2PA §A.3.1 `APP11` embedding; §18.5.3 exclusion rules |
-//! | [`x509`] | Enough DER to read a certificate (RFC 5280) |
+//! | [`x509`] | RFC 5280 certificates, plus the C2PA Certificate Policy extensions |
+//! | [`verify`] | Signature checking for every algorithm §13.2.1 allows |
+//! | [`trust`] | Path validation against a C2PA Trust List |
+//! | [`timestamp`] | RFC 3161 tokens; C2PA §15.8 |
+//! | [`identity`] | The public half of the signing credential |
 //! | [`cose`] | RFC 8152 `COSE_Sign1`, RFC 9360 `x5chain`; C2PA §13.2 |
-//! | [`signer`] | The build's key material |
 //! | [`manifest`] | C2PA §10 claims, §18 assertions, §15 validation |
+//! | [`crjson`] | The crJSON validation-result serialisation |
+//!
+//! # Where the signing key is
+//!
+//! Not here. Not anywhere in this crate, and not in the WebAssembly module the
+//! browser downloads. See [`identity`] for why that is a hard requirement of
+//! the C2PA Conformance Program rather than a preference, and
+//! `conformance/generator-product-security-architecture.md` for the whole
+//! Target of Evaluation.
 //!
 //! # Why JPEG only
 //!
@@ -23,52 +40,102 @@
 //! rules have to be written per format (§18.5.3 for JPEG, §18.5.4 for PNG, and
 //! so on). JPEG's `APP11` segments are the case the specification treats in the
 //! most detail, and they are what the overwhelming majority of C2PA tooling
-//! reads today.
+//! reads today. The Conforming Products List records exactly which media types
+//! a Generator Product asserts, so claiming one and doing it properly is also
+//! the shape the programme expects.
 //!
-//! Doing this properly for one format teaches more than doing it loosely for
-//! six. Every other output format the editor supports keeps working exactly as
-//! it did — it just does not get a credential, and the interface says so rather
+//! Every other output format the editor supports keeps working exactly as it
+//! did — it just does not get a credential, and the interface says so rather
 //! than leaving the option greyed out with no explanation.
-//!
-//! # What this proves and what it does not
-//!
-//! A credential written here genuinely establishes that the pixels have not
-//! changed since signing, and genuinely records what the editor did to them. It
-//! does not establish *who* signed: the key ships inside the page, so anyone can
-//! produce a manifest bearing this signer's name. See `signing/README.md`.
-//!
-//! Two things a production claim generator would add are missing for reasons
-//! that are about the environment rather than effort: an RFC 3161 time-stamp
-//! (§10.3.2.5) and a stapled OCSP response (§10.3.2.6). Both need a network
-//! round-trip to a third party while signing, which an app whose whole premise
-//! is that nothing leaves the tab cannot make. Their absence is reported to the
-//! user rather than hidden.
 
 pub mod cbor;
+pub mod clock;
 pub mod cose;
+pub mod crjson;
+pub mod der;
+pub mod identity;
 pub mod jpegxt;
 pub mod jumbf;
 pub mod manifest;
-pub mod signer;
+pub mod timestamp;
+pub mod trust;
+pub mod verify;
 pub mod x509;
+
+#[cfg(any(test, feature = "test-pki"))]
+pub mod testpki;
 
 use cbor::Value;
 use manifest::{Action, GeneratorInfo};
 
+pub use crjson::to_crjson;
+pub use identity::{SignerDescription, SigningIdentity};
 pub use manifest::{
-    read_jpeg, sign_jpeg, IngredientReport, ManifestReport, Parent, ParentStore, SignRequest,
-    Signed, ValidationReport,
+    read_jpeg, validate_jpeg, IngredientReport, ManifestReport, Parent, ParentStore, Prepared,
+    SignRequest, Signed, ValidationOptions, ValidationReport,
 };
+pub use trust::TrustStore;
 
 use crate::pipeline::Pipeline;
 
-/// The IPTC digital source type for an image a human captured or edited, as
-/// opposed to one a model generated. Recording it is how a viewer can tell the
-/// difference at a glance.
+/// The version of the C2PA Content Credentials specification this generator
+/// writes to.
+///
+/// The Conformance Program's *Additional Conformance Requirements* make this a
+/// contract rather than a note: the value recorded in `claim_generator_info`
+/// has to match the version asserted on the Program Intake Form and shown on
+/// the Conforming Products List record. Changing it here without changing the
+/// listing would put the product out of conformance, which is why it is one
+/// constant rather than a string repeated at each use.
+pub const SPEC_VERSION: &str = "2.2";
+
+/// The IPTC digital source type for an image a human captured, as opposed to
+/// one a model generated.
 ///
 /// <https://cv.iptc.org/newscodes/digitalsourcetype/>
 const SOURCE_TYPE_DIGITAL_CAPTURE: &str =
     "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture";
+
+/// "Augmentation, correction or enhancement by one or more humans using
+/// non-generative tools" — which is precisely what this editor does. Every
+/// operation it offers is a classical image-processing kernel driven by a
+/// person; nothing here is generative, and recording that explicitly is the
+/// point of the field.
+const SOURCE_TYPE_HUMAN_EDITS: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/humanEdits";
+
+/// Actions the Conformance Program excepts from the `digitalSourceType`
+/// requirement.
+///
+/// From *Additional Conformance Requirements Against the Content Credentials
+/// Specification* v0.2: the field is required in every pre-defined action
+/// carried in a created assertion except these. `c2pa.opened` goes further —
+/// for spec 2.4 a separate requirement *prohibits* the field there, because
+/// opening a byte stream has no source type to speak of.
+const NO_DIGITAL_SOURCE_TYPE: &[&str] = &[
+    "c2pa.converted",
+    "c2pa.edited.metadata",
+    "c2pa.enhanced",
+    "c2pa.opened",
+    "c2pa.placed",
+    "c2pa.published",
+    "c2pa.redacted",
+    "c2pa.repackaged",
+    "c2pa.resized.proportional",
+    "c2pa.transcoded",
+    "c2pa.watermarked",
+    "c2pa.watermarked.bound",
+    "c2pa.watermarked.unbound",
+];
+
+/// Whether a `digitalSourceType` is required on this action.
+pub fn requires_digital_source_type(action: &str) -> bool {
+    action.starts_with("c2pa.") && !NO_DIGITAL_SOURCE_TYPE.contains(&action)
+}
+
+/// Whether a `digitalSourceType` is forbidden on this action.
+pub fn forbids_digital_source_type(action: &str) -> bool {
+    action == "c2pa.opened"
+}
 
 /// Whether a manifest can be written for this output format.
 ///
@@ -82,6 +149,7 @@ pub fn generator() -> GeneratorInfo {
     GeneratorInfo {
         name: "A10city Image Editor".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        spec_version: Some(SPEC_VERSION.to_string()),
     }
 }
 
@@ -104,13 +172,11 @@ pub fn actions_for(pipeline: &Pipeline, opened: bool, output: (u32, u32)) -> Vec
 
     if opened {
         // Must be the first element, and must point at a parentOf ingredient.
-        // `manifest` wires up the ingredient reference itself.
+        // `manifest` wires up the ingredient reference itself. No
+        // digitalSourceType: the Conformance Program prohibits one here.
         actions.push(Action::new("c2pa.opened"));
     } else {
-        actions.push(Action::new("c2pa.created").param(
-            "digitalSourceType",
-            Value::text(SOURCE_TYPE_DIGITAL_CAPTURE),
-        ));
+        actions.push(Action::new("c2pa.created").source_type(SOURCE_TYPE_DIGITAL_CAPTURE));
     }
 
     if pipeline.flip_h || pipeline.flip_v || !pipeline.quarter_turns.is_multiple_of(4) {
@@ -211,6 +277,19 @@ pub fn actions_for(pipeline: &Pipeline, opened: bool, output: (u32, u32)) -> Vec
         );
     }
 
+    // Every editing action this product performs is a human driving a classical
+    // filter, so they all carry the same source type. Applying it here rather
+    // than at each construction site means a new action added above cannot
+    // silently omit a field the Conformance Program requires.
+    for action in &mut actions {
+        if requires_digital_source_type(&action.action) && action.digital_source_type.is_none() {
+            action.digital_source_type = Some(SOURCE_TYPE_HUMAN_EDITS.to_string());
+        }
+        if forbids_digital_source_type(&action.action) {
+            action.digital_source_type = None;
+        }
+    }
+
     actions
 }
 
@@ -255,6 +334,16 @@ mod tests {
     }
 
     #[test]
+    fn the_generator_declares_the_specification_version() {
+        // Required by the Conformance Program's additional requirements, and
+        // it has to match the Conforming Products List record.
+        let generator = generator();
+        assert_eq!(generator.spec_version.as_deref(), Some("2.2"));
+        assert!(!generator.name.is_empty());
+        assert!(!generator.version.is_empty());
+    }
+
+    #[test]
     fn an_opened_file_starts_with_c2pa_opened() {
         // Section 18.10.2 requires this as the first element, and section
         // 15.10.3.2.2 rejects the claim if it does not resolve to a parentOf
@@ -264,13 +353,102 @@ mod tests {
     }
 
     #[test]
+    fn c2pa_opened_never_carries_a_digital_source_type() {
+        // Prohibited outright by the Conformance Program: opening a byte
+        // stream has no source type to declare.
+        let actions = actions_for(&empty(), true, (100, 100));
+        assert_eq!(actions[0].digital_source_type, None);
+    }
+
+    #[test]
     fn a_new_file_starts_with_c2pa_created() {
         let actions = actions_for(&empty(), false, (100, 100));
         assert_eq!(actions[0].action, "c2pa.created");
-        assert!(actions[0]
-            .parameters
-            .iter()
-            .any(|(key, _)| key == "digitalSourceType"));
+        assert_eq!(
+            actions[0].digital_source_type.as_deref(),
+            Some(SOURCE_TYPE_DIGITAL_CAPTURE)
+        );
+    }
+
+    #[test]
+    fn every_action_that_needs_a_digital_source_type_has_one() {
+        // This is the check that keeps a newly added action from quietly
+        // failing conformance: it walks whatever `actions_for` produced rather
+        // than a list written out by hand.
+        let pipeline = Pipeline {
+            crop: Some(Crop {
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+            }),
+            quarter_turns: 1,
+            flip_h: true,
+            angle: -2.5,
+            resize: Some(Resize {
+                width: 15,
+                height: 20,
+                filter: "lanczos3".into(),
+            }),
+            adjust: crate::pipeline::AdjustSpec {
+                brightness: 0.1,
+                blur: 1.5,
+                sharpen: 0.8,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for action in actions_for(&pipeline, true, (15, 20)) {
+            if requires_digital_source_type(&action.action) {
+                assert!(
+                    action.digital_source_type.is_some(),
+                    "{} must carry a digitalSourceType",
+                    action.action
+                );
+            }
+            if forbids_digital_source_type(&action.action) {
+                assert!(
+                    action.digital_source_type.is_none(),
+                    "{} must not carry a digitalSourceType",
+                    action.action
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_excepted_actions_are_the_ones_the_programme_lists() {
+        assert!(!requires_digital_source_type("c2pa.enhanced"));
+        assert!(!requires_digital_source_type("c2pa.opened"));
+        assert!(!requires_digital_source_type("c2pa.resized.proportional"));
+        assert!(requires_digital_source_type("c2pa.resized"));
+        assert!(requires_digital_source_type("c2pa.cropped"));
+        assert!(requires_digital_source_type("c2pa.filtered"));
+        // Entity-specific actions are outside the requirement entirely.
+        assert!(!requires_digital_source_type("com.a10city.something"));
+    }
+
+    #[test]
+    fn nothing_generative_is_ever_claimed() {
+        // The whole reason the Conformance Program made this field mandatory
+        // is so a reader can tell generative AI from a person with a crop tool.
+        let pipeline = Pipeline {
+            adjust: crate::pipeline::AdjustSpec {
+                blur: 2.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for action in actions_for(&pipeline, true, (10, 10)) {
+            if let Some(source) = &action.digital_source_type {
+                assert!(
+                    source.ends_with("humanEdits") || source.ends_with("digitalCapture"),
+                    "{} claims {source}",
+                    action.action
+                );
+            }
+        }
     }
 
     #[test]
@@ -364,7 +542,7 @@ mod tests {
         };
         for action in actions_for(&pipeline, true, (10, 10)) {
             for (key, _) in &action.parameters {
-                let known = ["ingredients", "digitalSourceType", "description"];
+                let known = ["ingredients", "description"];
                 assert!(
                     known.contains(&key.as_str()) || key.starts_with("com.a10city."),
                     "parameter {key} is neither predefined nor namespaced"
