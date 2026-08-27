@@ -220,6 +220,10 @@ nothing.
 
 [verify]: https://contentcredentials.org/verify
 
+The full procedure — including the TLS and authentication checks this section
+skips, the two results that look like failures and are not, and where to get the
+trust list PEMs — is [`services/claim-signer/TESTING.md`](../services/claim-signer/TESTING.md).
+
 ---
 
 ## Keeping it

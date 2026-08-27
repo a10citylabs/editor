@@ -185,3 +185,14 @@ moved between versions does not decrypt, that a key which does not match its
 certificate stops the service starting, that a replayed request is refused and a
 forged one does not consume its nonce, and that the TSA request carries a digest
 and not the signature.
+
+Those test the code. Testing a *deployment* — that this service, on this host,
+with this certificate, produces credentials someone else's validator accepts —
+is [`TESTING.md`](TESTING.md), which covers both a local run on the test PKI and
+a production one on an SSL.com credential. `scripts/smoke-test.sh` exercises a
+running service, including the refusals:
+
+```sh
+./services/claim-signer/scripts/smoke-test.sh \
+    --url https://sign.example.com --key-id "$KEY_ID" --secret "$SECRET"
+```
