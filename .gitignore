@@ -16,3 +16,8 @@ target
 # Python bytecode from the conformance scripts.
 __pycache__/
 *.pyc
+
+# The local claim-signer configuration. It carries the Edge's HMAC secret in
+# development, and a deployment's copy is written by the deploy workflow from
+# repository variables — neither belongs in the repository.
+/apps/editor/public/claim-signer.json

@@ -453,17 +453,35 @@ CLAIM_SIGNER_ALLOW_PLAINTEXT=1 cargo run -p claim-signer -- serve
 
 with `CLAIM_SIGNER_KEYSTORE`, `CLAIM_SIGNER_KEK` and `CLAIM_SIGNER_CLIENTS` set
 — see [`services/claim-signer/README.md`](services/claim-signer/README.md).
-Then put a `claim-signer.json` in `apps/editor/public/`:
+Then put a `claim-signer.json` in `apps/editor/public/` (git-ignored, because it
+carries a secret):
 
 ```json
 {
-  "url": "http://localhost:8443",
+  "url": "/signer",
   "credential": { "keyId": "dev", "secret": "<the same base64 secret>" }
 }
 ```
 
+`/signer` rather than `http://localhost:8443`: the service serves no CORS
+headers, because the deployment it is written for puts the Edge and the Backend
+behind one origin, so the dev server proxies `/signer/*` to the service instead
+— stripping the prefix, which is not optional, since the request MAC covers the
+literal path `/v1/sign`. A production reverse proxy has to do the same.
+
 `CLAIM_SIGNER_ALLOW_PLAINTEXT` is a development-only escape hatch and logs a
 warning naming the conformance objective it violates every time it starts.
+
+To check the service itself — the two public endpoints, a real signature, and
+the refusals that matter:
+
+```sh
+./services/claim-signer/scripts/smoke-test.sh \
+    --url http://localhost:8443 --key-id dev --secret "<the same base64 secret>"
+```
+
+[`services/claim-signer/TESTING.md`](services/claim-signer/TESTING.md) is the
+whole procedure, locally and against a production SSL.com credential.
 
 To check the credentials against something other than this code, install the
 reference tool and point it at a JPEG the app exported:
